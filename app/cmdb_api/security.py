@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
 from pathlib import Path
@@ -32,13 +33,14 @@ class ApiTokenGuard:
             return True
         if not provided:
             return False
-        return secrets.compare_digest(provided.strip(), self._token)
+        # Hash both sides so compare_digest always compares equal-length digests
+        # (avoids length-dependent short-circuit of the raw secret).
+        expected = hashlib.sha256(self._token.encode("utf-8")).digest()
+        got = hashlib.sha256(provided.strip().encode("utf-8")).digest()
+        return secrets.compare_digest(expected, got)
 
     def status(self) -> dict[str, bool]:
         return {"token_required": self.required}
-
-
-GUARD = ApiTokenGuard()
 
 
 def active_guard() -> ApiTokenGuard:

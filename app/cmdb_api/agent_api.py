@@ -68,7 +68,7 @@ def build_agent_router(store: CmdbStore) -> APIRouter:
         q: str | None = Query(None, description="Substring match across searchable fields"),
         kind: str | None = Query(None, description="server | service | application | environment"),
         status: str | None = Query(None, description="active | deprecated | planned | unknown"),
-        env: str | None = Query(None, description="Environment id, e.g. home-lab"),
+        env: str | None = Query(None, description="Environment id, e.g. demo-lab"),
         role: str | None = Query(None, description="Exact role match (servers)"),
         runtime: str | None = Query(None, description="Application runtime, e.g. k3s or host"),
     ) -> dict[str, Any]:
@@ -126,7 +126,7 @@ def build_agent_router(store: CmdbStore) -> APIRouter:
     @router.get(
         "/by-address",
         summary="Resolve address to servers",
-        description="Match IPv4, hostname, Tailscale IP, DNS alias, or SSH host against server CIs.",
+        description="Match IPv4/IPv6, hostname, Tailscale IP, DNS alias, or SSH host against server CIs.",
     )
     def agent_by_address(
         q: str = Query(..., min_length=1, description="Address or hostname fragment"),

@@ -86,7 +86,7 @@ kubectl -n cmdb create secret generic cmdb-api-token --from-literal=token='your-
 
 helm upgrade --install cmdb-frontend ./chart/cmdb-frontend -n cmdb \
   --set apiToken.existingSecret=cmdb-api-token \
-  --set env.CMDB_DEFAULT_SSH_USER=lou
+  --set env.CMDB_DEFAULT_SSH_USER=ops
 ```
 
 Leave `apiToken` unset for open local/dev. Empty `CMDB_DEFAULT_SSH_USER` omits auto `ssh:` on LAN add (port 22); set it to prefer a default user.

@@ -47,7 +47,7 @@ export function NetworkRescanDialog({ open, envs, onClose, onAdded, onAuthRequir
   const [env, setEnv] = useState('')
 
   const defaultEnv = useMemo(() => {
-    if (envs.includes('home-lab')) return 'home-lab'
+    if (envs.includes('demo-lab')) return 'demo-lab'
     return envs[0] || ''
   }, [envs])
 
@@ -158,7 +158,8 @@ export function NetworkRescanDialog({ open, envs, onClose, onAdded, onAuthRequir
           env: env || null,
           status: 'unknown',
           ports: h.ports,
-          ssh_user: h.ssh_open ? 'lou' : null,
+          // Leave ssh_user unset — server applies CMDB_DEFAULT_SSH_USER when port 22 is open.
+          ssh_user: null,
         }
       })
       const addResult = await addNetworkDevices(devices)

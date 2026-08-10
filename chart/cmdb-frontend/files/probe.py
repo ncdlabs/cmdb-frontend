@@ -6,7 +6,9 @@ import os
 import re
 import shlex
 import subprocess
+import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 REMOTE_SCRIPT = r"""
@@ -152,6 +154,59 @@ _SSH_DEST_RE = re.compile(
     r"^(?:[A-Za-z0-9._+-]+@)?"
     r"(?:\[[0-9A-Fa-f:]+\]|[A-Za-z0-9._-]+)$"
 )
+_PROBE_ERROR_MAX = 400
+_PROBE_TIMEOUT_DEFAULT = 20
+_PROBE_TIMEOUT_MIN = 5
+_PROBE_TIMEOUT_MAX = 60
+
+
+def _known_hosts_file() -> str:
+    """Private known_hosts under a 0700 directory (not a world-writable shared file)."""
+    base = Path(tempfile.gettempdir()) / "cmdb-ssh"
+    try:
+        base.mkdir(mode=0o700, exist_ok=True)
+        try:
+            os.chmod(base, 0o700)
+        except OSError:
+            pass
+        path = base / "known_hosts"
+        if not path.exists():
+            path.touch(mode=0o600)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+        return str(path)
+    except OSError:
+        # Last resort: still avoid a shared world-writable path name.
+        fallback = Path(tempfile.gettempdir()) / f"cmdb_known_hosts_{os.getuid()}"
+        try:
+            if not fallback.exists():
+                fallback.touch(mode=0o600)
+        except OSError:
+            pass
+        return str(fallback)
+
+
+def _sanitize_probe_error(detail: str, max_len: int = _PROBE_ERROR_MAX) -> str:
+    text = (detail or "").replace("\x00", "").strip()
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_len:
+        return text[: max_len - 1] + "…"
+    return text or "ssh probe failed"
+
+
+def _clamp_probe_timeout(timeout: int) -> int:
+    try:
+        value = int(timeout)
+    except (TypeError, ValueError):
+        value = _PROBE_TIMEOUT_DEFAULT
+    return max(_PROBE_TIMEOUT_MIN, min(value, _PROBE_TIMEOUT_MAX))
+
+
+def _has_control_chars(value: str) -> bool:
+    return any(ord(c) < 32 or ord(c) == 127 for c in value)
 
 
 def parse_ssh_target(ssh_field: str) -> tuple[list[str], str | None]:
@@ -159,6 +214,8 @@ def parse_ssh_target(ssh_field: str) -> tuple[list[str], str | None]:
     raw = (ssh_field or "").strip()
     if not raw:
         return [], "no ssh field"
+    if _has_control_chars(raw):
+        return [], "ssh target contains control characters"
     # Drop trailing parenthetical notes: "user@host (key name)"
     raw = re.sub(r"\s*\([^)]*\)\s*$", "", raw).strip()
     try:
@@ -190,10 +247,17 @@ def parse_ssh_target(ssh_field: str) -> tuple[list[str], str | None]:
 
     if not user_host:
         return [], f"could not parse ssh target: {ssh_field}"
+    if _has_control_chars(user_host):
+        return [], f"unsafe or invalid ssh destination: {user_host}"
     if not _SSH_DEST_RE.match(user_host):
         return [], f"unsafe or invalid ssh destination: {user_host}"
-    if port is not None and not str(port).isdigit():
-        return [], f"invalid ssh port: {port}"
+    if "@" in user_host:
+        user, _, host = user_host.rpartition("@")
+        if not user or not host:
+            return [], f"unsafe or invalid ssh destination: {user_host}"
+    if port is not None:
+        if not str(port).isdigit() or not (1 <= int(port) <= 65535):
+            return [], f"invalid ssh port: {port}"
 
     argv = [
         "ssh",
@@ -204,9 +268,11 @@ def parse_ssh_target(ssh_field: str) -> tuple[list[str], str | None]:
         "-o",
         "StrictHostKeyChecking=accept-new",
         "-o",
-        "UserKnownHostsFile=/tmp/cmdb_known_hosts",
+        f"UserKnownHostsFile={_known_hosts_file()}",
         "-o",
         "LogLevel=ERROR",
+        "-o",
+        "GlobalKnownHostsFile=/dev/null",
     ]
     ssh_dir = os.environ.get("CMDB_SSH_DIR", "").strip()
     identity = os.environ.get("CMDB_SSH_IDENTITY", "").strip()
@@ -214,9 +280,11 @@ def parse_ssh_target(ssh_field: str) -> tuple[list[str], str | None]:
     if ssh_dir and os.path.isdir(ssh_dir):
         for name in ("id_ed25519", "id_rsa", "id_ecdsa", "id_dsa"):
             path = os.path.join(ssh_dir, name)
-            if os.path.isfile(path):
+            if os.path.isfile(path) and "\x00" not in path:
                 identities.append(path)
     elif identity:
+        if "\x00" in identity or not os.path.isfile(identity):
+            return [], "invalid CMDB_SSH_IDENTITY path"
         identities.append(identity)
     if identities:
         argv.extend(["-o", "IdentitiesOnly=yes"])
@@ -226,6 +294,18 @@ def parse_ssh_target(ssh_field: str) -> tuple[list[str], str | None]:
         argv.extend(["-p", str(port)])
     argv.append(user_host)
     return argv, None
+
+
+def _probe_subprocess_env() -> dict[str, str]:
+    """Minimal env for ssh — avoid leaking unrelated secrets into the child."""
+    keep = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME", "TMPDIR")
+    env = {k: v for k, v in os.environ.items() if k in keep and isinstance(v, str)}
+    if "PATH" not in env:
+        env["PATH"] = "/usr/bin:/bin"
+    if "HOME" not in env:
+        env["HOME"] = tempfile.gettempdir()
+    env.setdefault("LANG", "C.UTF-8")
+    return env
 
 
 def _kb_to_bytes(value: str | None) -> int | None:
@@ -331,7 +411,10 @@ def parse_probe_output(text: str) -> dict[str, Any]:
         if not line:
             continue
         if line.startswith("TEMP|"):
-            _, name, val = line.split("|", 2)
+            bits = line.split("|", 2)
+            if len(bits) < 3:
+                continue
+            _, name, val = bits
             try:
                 celsius = float(val)
             except ValueError:
@@ -565,12 +648,13 @@ def parse_probe_output(text: str) -> dict[str, Any]:
     }
 
 
-def probe_host(ssh_field: str, timeout: int = 20) -> dict[str, Any]:
+def probe_host(ssh_field: str, timeout: int = _PROBE_TIMEOUT_DEFAULT) -> dict[str, Any]:
     argv, err = parse_ssh_target(ssh_field)
     probed_at = datetime.now(timezone.utc).isoformat()
     if err:
         return {"ok": False, "probed_at": probed_at, "ssh": ssh_field, "error": err, "live": None}
 
+    timeout = _clamp_probe_timeout(timeout)
     cmd = argv + ["bash", "-s"]
     try:
         completed = subprocess.run(
@@ -580,6 +664,7 @@ def probe_host(ssh_field: str, timeout: int = 20) -> dict[str, Any]:
             text=True,
             timeout=timeout,
             check=False,
+            env=_probe_subprocess_env(),
         )
     except subprocess.TimeoutExpired:
         return {
@@ -602,7 +687,7 @@ def probe_host(ssh_field: str, timeout: int = 20) -> dict[str, Any]:
             "ok": False,
             "probed_at": probed_at,
             "ssh": ssh_field,
-            "error": str(exc),
+            "error": _sanitize_probe_error(str(exc)),
             "live": None,
         }
 
@@ -612,7 +697,7 @@ def probe_host(ssh_field: str, timeout: int = 20) -> dict[str, Any]:
             "ok": False,
             "probed_at": probed_at,
             "ssh": ssh_field,
-            "error": detail or f"ssh exited {completed.returncode}",
+            "error": _sanitize_probe_error(detail or f"ssh exited {completed.returncode}"),
             "live": None,
         }
 

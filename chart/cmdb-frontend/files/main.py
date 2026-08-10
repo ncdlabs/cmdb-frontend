@@ -37,21 +37,21 @@ app = FastAPI(
 
 
 class NetworkDeviceAdd(BaseModel):
-    ip: str
-    id: str | None = None
-    name: str | None = None
-    hostname: str | None = None
-    ipv4: str | None = None
-    ipv6: str | None = None
-    env: str | None = None
-    status: str = "unknown"
-    ports: list[int] = Field(default_factory=list)
-    ssh_user: str | None = None
-    notes: str | None = None
+    ip: str = Field(..., min_length=1, max_length=128)
+    id: str | None = Field(None, max_length=128)
+    name: str | None = Field(None, max_length=128)
+    hostname: str | None = Field(None, max_length=253)
+    ipv4: str | None = Field(None, max_length=64)
+    ipv6: str | None = Field(None, max_length=128)
+    env: str | None = Field(None, max_length=64)
+    status: str = Field("unknown", max_length=32)
+    ports: list[int] = Field(default_factory=list, max_length=64)
+    ssh_user: str | None = Field(None, max_length=32)
+    notes: str | None = Field(None, max_length=2000)
 
 
 class NetworkAddRequest(BaseModel):
-    devices: list[NetworkDeviceAdd]
+    devices: list[NetworkDeviceAdd] = Field(..., min_length=1, max_length=64)
 
 
 @app.middleware("http")

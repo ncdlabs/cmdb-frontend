@@ -20,6 +20,8 @@ TCP_TIMEOUT_S = 0.35
 MAX_WORKERS = 64
 # Never brute-force larger IPv6 prefixes (a /64 is ~1.8e19).
 IPV6_SWEEP_MAX_HOSTS = 256
+# Cap IPv4 sweeps too — a mis-set /8 or /0 must not hang the API.
+IPV4_SWEEP_MAX_HOSTS = 1024
 NEIGH_OK_STATES = {"REACHABLE", "STALE", "DELAY", "PROBE", "PERMANENT", "NOARP"}
 
 # Re-export AddressExtractor helpers so existing imports keep working.
@@ -574,6 +576,13 @@ def scan_subnets(
             v6_nets.append(network)
 
     for network in v4_nets:
+        host_count = network.num_addresses if network.num_addresses <= 2 else network.num_addresses - 2
+        if host_count > IPV4_SWEEP_MAX_HOSTS:
+            notes.append(
+                f"Skipping IPv4 sweep of {network} ({host_count} hosts); "
+                f"max is {IPV4_SWEEP_MAX_HOSTS} — narrow env.network.lan_cidr"
+            )
+            continue
         hosts = list(network.hosts()) if network.num_addresses > 2 else list(network)
         for host in hosts:
             ip = str(host)
@@ -735,6 +744,19 @@ def scan_subnets(
 
 _ID_RE = re.compile(r"^srv-[a-z0-9]+(?:-[a-z0-9]+)*$")
 _NAME_SLUG_RE = re.compile(r"[^a-z0-9]+")
+_SSH_USER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,31}$")
+
+
+def validate_ssh_user(user: str | None) -> str | None:
+    """Return an error message if ssh_user is unsafe; None if OK or empty."""
+    if user is None:
+        return None
+    if not isinstance(user, str) or not user.strip():
+        return None
+    token = user.strip()
+    if not _SSH_USER_RE.match(token):
+        return "ssh_user must be a plain POSIX username (letters, digits, _-; max 32)"
+    return None
 
 
 def suggest_server_id(ip: str, hostname: str | None = None) -> str:

@@ -2,7 +2,7 @@
 
 ## Last updated
 
-2026-08-09 (public-repo scrub: sample inventory + generic placeholders)
+2026-08-09 (production hardening: probe SSH path + scan/loader safety)
 
 ## Architecture
 
@@ -10,7 +10,7 @@
 - Helm chart: `chart/cmdb-frontend` — **StatefulSet** + Service + Ingress HTTP+HTTPS, Traefik redirect Middleware, TLS
 - Writable inventory: PVC `inventory-data` (`persistence.enabled`, storageClass `local-path`); initContainer seeds from `/data/cmdb-seed` once
 - Live metrics: `app/cmdb_api/probe.py` via SSH; UI triggers only on Refresh (includes physical_disks + NIC negotiated speed)
-- LAN discovery: `app/cmdb_api/scan.py` — IPv4 sweep + IPv6 NDP/AAAA (no /64 brute-force); Rescan → `POST /api/network/scan` + `POST /api/network/devices`
+- LAN discovery: `app/cmdb_api/scan.py` — IPv4 sweep (capped ≤1024 hosts/prefix) + IPv6 NDP/AAAA (no /64 brute-force); Rescan → `POST /api/network/scan` + `POST /api/network/devices`
 - Chart can use `hostNetwork: true` + `dnsPolicy: ClusterFirstWithHostNet` so NDP sees node LAN neighbors
 - Probe/loader/agent_api/main/scan shipped via Helm ConfigMap `cmdb-frontend-probe` (mount over `/app/cmdb_api/*.py`)
 - Browse list: Active / Deprecated tabs; URL `?tab=deprecated`
@@ -46,7 +46,8 @@
 - Pod may be pinned via `nodeSelector` — set explicitly in values if you need hostNetwork NDP on a specific node
 - `latest` tag needs `rollout restart` after image import (StatefulSet: `kubectl rollout restart sts/cmdb-frontend -n cmdb`)
 - Helm SSA can conflict with prior `kubectl replace` on podAnnotations — prefer `rollout restart`
-- After agent/probe/API changes: sync `chart/cmdb-frontend/files/{loader,agent_api,main,probe,scan}.py` then `helm upgrade` + rollout
+- After agent/probe/API changes: sync `chart/cmdb-frontend/files/{loader,agent_api,main,probe,scan,addresses,security}.py` then `helm upgrade` + rollout
+- LAN Add leaves `ssh_user` unset from the UI; set `CMDB_DEFAULT_SSH_USER` in Helm for auto `user@host` when port 22 is open
 - UI changes require image rebuild (ConfigMap does not ship frontend)
 - PVC inventory diverges from git `inventory/` until you copy YAML back; image rebuild alone does not wipe PVC (seed only if empty)
 - Deployment→StatefulSet upgrade: remove old Deployment first then `helm upgrade`

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -10,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from cmdb_api.addresses import AddressExtractor
 from cmdb_api.probe import parse_ssh_target
-from cmdb_api.scan import suggest_server_id, validate_server_id
+from cmdb_api.scan import suggest_server_id, validate_server_id, validate_ssh_user
 from cmdb_api.security import ApiTokenGuard, StaticPathResolver, extract_bearer_or_header
 
 
@@ -64,6 +63,11 @@ class TestAddressExtractor:
         assert AddressExtractor.from_cidr_or_addr("192.168.1.5/24") == "192.168.1.5"
         assert AddressExtractor.ipv6_from_cidr_or_addr("2001:db8::1/64") == "2001:db8::1"
 
+    def test_rejects_garbage(self) -> None:
+        assert AddressExtractor.from_cidr_or_addr("not-an-ip") is None
+        assert AddressExtractor.ssh_host("") is None
+        assert AddressExtractor.ssh_host(None) is None
+
 
 class TestSshTarget:
     def test_valid_target(self) -> None:
@@ -83,6 +87,39 @@ class TestSshTarget:
         assert argv[-1] == "user@host"
         assert "ProxyCommand=evil" not in argv
 
+    def test_rejects_out_of_range_port(self) -> None:
+        argv, err = parse_ssh_target("ops@host -p 70000")
+        assert argv == []
+        assert err is not None
+        assert "port" in (err or "").lower()
+
+    def test_rejects_zero_port(self) -> None:
+        argv, err = parse_ssh_target("ops@host -p 0")
+        assert argv == []
+        assert err is not None
+
+    def test_rejects_control_chars(self) -> None:
+        argv, err = parse_ssh_target("ops@host\n-oProxyCommand=evil")
+        assert argv == []
+        assert err is not None
+
+    def test_known_hosts_is_private_path(self) -> None:
+        argv, err = parse_ssh_target("ops@host.example")
+        assert err is None
+        joined = " ".join(argv)
+        assert "UserKnownHostsFile=" in joined
+        assert "/tmp/cmdb_known_hosts " not in joined + " "
+        assert "cmdb-ssh" in joined or "cmdb_known_hosts_" in joined
+
+    def test_sanitize_probe_error_truncates(self) -> None:
+        from cmdb_api.probe import _sanitize_probe_error
+
+        long = "x" * 1000
+        out = _sanitize_probe_error(long)
+        assert len(out) <= 400
+        assert out.endswith("…")
+        assert "\x00" not in _sanitize_probe_error("a\x00b\n\tc")
+
 
 class TestServerId:
     def test_suggest_and_validate(self) -> None:
@@ -90,6 +127,76 @@ class TestServerId:
         assert sid == "srv-pi"
         assert validate_server_id(sid) is None
         assert validate_server_id("../etc/passwd") is not None
+
+    def test_ssh_user_validation(self) -> None:
+        assert validate_ssh_user(None) is None
+        assert validate_ssh_user("ops") is None
+        assert validate_ssh_user("ops;rm") is not None
+        assert validate_ssh_user("a" * 40) is not None
+        assert validate_ssh_user("../x") is not None
+
+
+class TestScanCaps:
+    def test_skips_oversized_ipv4_prefix(self) -> None:
+        from cmdb_api.scan import scan_subnets
+
+        result = scan_subnets(["10.0.0.0/8"], set())
+        assert result["ok"] is True
+        assert result["targets"] == 0
+        assert any("Skipping IPv4 sweep" in n for n in result.get("notes") or [])
+
+    def test_allows_typical_slash24(self) -> None:
+        from cmdb_api.scan import IPV4_SWEEP_MAX_HOSTS
+
+        # /24 has 254 hosts — always under the production cap.
+        assert IPV4_SWEEP_MAX_HOSTS >= 254
+
+
+class TestLoaderHardening:
+    def test_duplicate_ids_reported(self, inventory_root: Path) -> None:
+        from cmdb_api.loader import CmdbStore
+
+        (inventory_root / "services" / "svc-dup.yaml").write_text(
+            "\n".join(
+                [
+                    "id: srv-test",
+                    "kind: service",
+                    "name: colliding",
+                    "status: active",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        store = CmdbStore(root=inventory_root, refresh_seconds=999)
+        meta = store.meta()
+        assert meta["error_count"] >= 1
+        assert any("Duplicate CI id" in e["error"] for e in meta["load_errors"])
+        # First-loaded server wins
+        item = store.get_item("srv-test")
+        assert item is not None
+        assert item.get("kind") == "server"
+
+    def test_by_address_matches_ipv6(self, inventory_root: Path) -> None:
+        from cmdb_api.loader import CmdbStore
+
+        (inventory_root / "servers" / "srv-v6.yaml").write_text(
+            "\n".join(
+                [
+                    "id: srv-v6",
+                    "kind: server",
+                    "name: v6",
+                    "status: active",
+                    "addresses:",
+                    "  ipv6: 2001:db8::99",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        store = CmdbStore(root=inventory_root, refresh_seconds=999)
+        hits = store.by_address("2001:db8::99")
+        assert any(h.get("id") == "srv-v6" for h in hits)
 
 
 class TestStaticPathResolver:
@@ -104,6 +211,8 @@ class TestStaticPathResolver:
         assert resolver.resolve_file("asset.txt") == (static / "asset.txt").resolve()
         assert resolver.resolve_file("../secret.txt") is None
         assert resolver.resolve_file("foo/../../secret.txt") is None
+        assert resolver.resolve_file("/etc/passwd") is None
+        assert resolver.resolve_file("file://etc/passwd") is None
 
 
 class TestApiTokenGuard:
@@ -116,10 +225,16 @@ class TestApiTokenGuard:
         assert guard.verify(None) is False
         assert guard.verify("wrong") is False
         assert guard.verify("s3cret") is True
+        assert guard.verify(" s3cret ") is True
+
+    def test_length_mismatch_still_false(self) -> None:
+        guard = ApiTokenGuard("short")
+        assert guard.verify("a-much-longer-candidate") is False
 
     def test_bearer_extract(self) -> None:
         assert extract_bearer_or_header(None, "Bearer abc") == "abc"
         assert extract_bearer_or_header("hdr", "Bearer abc") == "hdr"
+        assert extract_bearer_or_header(None, "Basic abc") is None
 
 
 class TestApiRoutes:
@@ -140,7 +255,52 @@ class TestApiRoutes:
         # SSH may fail in CI; auth must succeed (not 401).
         assert allowed.status_code != 401
 
+    def test_bearer_auth_accepted(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CMDB_API_TOKEN", "bearer-secret")
+        denied = client.post("/api/network/scan")
+        assert denied.status_code == 401
+        allowed = client.post(
+            "/api/network/scan",
+            headers={"Authorization": "Bearer bearer-secret"},
+        )
+        assert allowed.status_code != 401
+
     def test_agent_search_unauthenticated(self, client: TestClient) -> None:
         res = client.get("/api/agent/search", params={"kind": "server"})
         assert res.status_code == 200
         assert res.json()["count"] >= 1
+
+    def test_network_add_rejects_oversized_batch(self, client: TestClient) -> None:
+        devices = [
+            {"ip": f"10.0.0.{i}", "id": f"srv-host-10-0-0-{i}", "name": f"h{i}"}
+            for i in range(65)
+        ]
+        res = client.post("/api/network/devices", json={"devices": devices})
+        assert res.status_code == 422
+
+    def test_network_add_rejects_bad_ssh_user(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("CMDB_DEFAULT_SSH_USER", raising=False)
+        res = client.post(
+            "/api/network/devices",
+            json={
+                "devices": [
+                    {
+                        "ip": "10.0.0.99",
+                        "id": "srv-bad-user",
+                        "name": "bad",
+                        "ssh_user": "ops;rm -rf /",
+                        "ports": [22],
+                    }
+                ]
+            },
+        )
+        # 400 with structured errors, or 422 if pydantic catches first
+        assert res.status_code in (400, 422)
+        if res.status_code == 400:
+            body = res.json()
+            detail = body.get("detail") or body
+            assert detail.get("error_count", 0) >= 1 or "ssh_user" in str(detail).lower()

@@ -22,6 +22,7 @@ from cmdb_api.scan import (
     ipv6_from_cidr_or_addr,
     suggest_server_id,
     validate_server_id,
+    validate_ssh_user,
 )
 
 KIND_DIRS = {
@@ -118,7 +119,7 @@ def _address_candidates(item: dict[str, Any]) -> list[str]:
     out: list[str] = []
     addresses = item.get("addresses")
     if isinstance(addresses, dict):
-        for key in ("ipv4", "hostname", "tailscale"):
+        for key in ("ipv4", "ipv6", "hostname", "tailscale"):
             val = addresses.get(key)
             if isinstance(val, str) and val.strip():
                 out.append(val.strip())
@@ -194,13 +195,25 @@ class CmdbStore:
                     if not isinstance(data, dict):
                         errors.append({"path": rel, "error": "root is not a mapping"})
                         continue
-                    item_id = data.get("id") or path.stem
+                    item_id = str(data.get("id") or path.stem)
                     data = dict(data)
                     data.setdefault("id", item_id)
                     data.setdefault("kind", kind)
                     data["path"] = rel
                     data["_search"] = _search_blob(data)
-                    items[str(item_id)] = data
+                    if item_id in items:
+                        prev = items[item_id]
+                        errors.append(
+                            {
+                                "path": rel,
+                                "error": (
+                                    f"Duplicate CI id '{item_id}' "
+                                    f"(also defined in {prev.get('path')})"
+                                ),
+                            }
+                        )
+                        continue
+                    items[item_id] = data
                 except Exception as exc:  # noqa: BLE001
                     errors.append({"path": rel, "error": str(exc)})
 
@@ -425,7 +438,13 @@ class CmdbStore:
                 continue
 
             ports_raw = raw.get("ports") or []
-            ports = [int(p) for p in ports_raw if isinstance(p, (int, float, str)) and str(p).isdigit()]
+            ports = [
+                int(p)
+                for p in ports_raw
+                if isinstance(p, (int, float, str))
+                and str(p).isdigit()
+                and 1 <= int(p) <= 65535
+            ]
             ssh_user = raw.get("ssh_user")
             default_ssh = os.environ.get("CMDB_DEFAULT_SSH_USER", "").strip()
             ssh_user_s = (
@@ -433,8 +452,18 @@ class CmdbStore:
                 if isinstance(ssh_user, str) and ssh_user.strip()
                 else (default_ssh if default_ssh and 22 in ports else None)
             )
+            ssh_err = validate_ssh_user(ssh_user_s)
+            if ssh_err:
+                errors.append({"ip": primary, "id": item_id, "error": ssh_err})
+                continue
             notes = raw.get("notes")
             notes_s = str(notes).strip() if isinstance(notes, str) and notes.strip() else None
+            if notes_s and len(notes_s) > 2000:
+                errors.append({"ip": primary, "id": item_id, "error": "notes too long (max 2000)"})
+                continue
+            if len(name) > 128:
+                errors.append({"ip": primary, "id": item_id, "error": "name too long (max 128)"})
+                continue
 
             doc = build_server_document(
                 item_id=item_id,
@@ -449,14 +478,15 @@ class CmdbStore:
                 notes=notes_s,
             )
             path = servers_dir / f"{item_id}.yaml"
-            if path.exists():
-                errors.append({"ip": primary, "id": item_id, "error": f"File already exists: {path.name}"})
-                continue
             try:
-                path.write_text(
-                    yaml.safe_dump(doc, sort_keys=False, default_flow_style=False),
-                    encoding="utf-8",
+                # Exclusive create — refuse if another request raced us.
+                with path.open("x", encoding="utf-8") as handle:
+                    yaml.safe_dump(doc, handle, sort_keys=False, default_flow_style=False)
+            except FileExistsError:
+                errors.append(
+                    {"ip": primary, "id": item_id, "error": f"File already exists: {path.name}"}
                 )
+                continue
             except OSError as exc:
                 errors.append({"ip": primary, "id": item_id, "error": str(exc)})
                 continue
@@ -841,11 +871,13 @@ class CmdbStore:
             summary["endpoints"] = endpoints[:3]
         addresses = item.get("addresses")
         if isinstance(addresses, dict):
-            summary["addresses"] = {
+            filtered = {
                 k: addresses[k]
-                for k in ("ipv4", "hostname", "tailscale")
+                for k in ("ipv4", "ipv6", "hostname", "tailscale")
                 if k in addresses
             }
+            if filtered:
+                summary["addresses"] = filtered
         placement_summary = CmdbStore._placement_summary(item)
         if placement_summary:
             summary["placement_summary"] = placement_summary

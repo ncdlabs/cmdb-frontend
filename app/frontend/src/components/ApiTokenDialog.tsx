@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import { getStoredApiToken, setStoredApiToken } from '../api'
 
 type Props = {
@@ -13,6 +13,9 @@ export function ApiTokenDialog({ open, tokenRequired, onClose, onSaved }: Props)
   const [baseline, setBaseline] = useState('')
   const [value, setValue] = useState('')
   const [error, setError] = useState<string | null>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
+  const titleId = useId()
+  const errorId = useId()
 
   useEffect(() => {
     if (!open) return
@@ -20,7 +23,21 @@ export function ApiTokenDialog({ open, tokenRequired, onClose, onSaved }: Props)
     setBaseline(stored)
     setValue(stored)
     setError(null)
+    const focusTimer = window.setTimeout(() => inputRef.current?.focus(), 0)
+    return () => window.clearTimeout(focusTimer)
   }, [open])
+
+  useEffect(() => {
+    if (!open) return
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        onClose()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [open, onClose])
 
   if (!open) return null
 
@@ -47,11 +64,11 @@ export function ApiTokenDialog({ open, tokenRequired, onClose, onSaved }: Props)
         className="dialog-panel dialog-panel-narrow"
         role="dialog"
         aria-modal="true"
-        aria-labelledby="api-token-title"
+        aria-labelledby={titleId}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="panel-header">
-          <h2 id="api-token-title">API token</h2>
+          <h2 id={titleId}>API token</h2>
           <button type="button" className="btn btn-secondary" onClick={onClose}>
             Close
           </button>
@@ -65,20 +82,22 @@ export function ApiTokenDialog({ open, tokenRequired, onClose, onSaved }: Props)
           <div className="form-field">
             <label htmlFor="api-token-input">Token</label>
             <input
+              ref={inputRef}
               id="api-token-input"
               type="password"
               className="search-input"
               autoComplete="off"
+              spellCheck={false}
               value={value}
               onChange={(e) => {
                 setValue(e.target.value)
                 setError(null)
               }}
               aria-invalid={Boolean(error)}
-              aria-describedby={error ? 'api-token-error' : undefined}
+              aria-describedby={error ? errorId : undefined}
             />
             {error ? (
-              <div id="api-token-error" className="field-error" role="alert">
+              <div id={errorId} className="field-error" role="alert">
                 {error}
               </div>
             ) : null}
