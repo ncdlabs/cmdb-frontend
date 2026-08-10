@@ -1,0 +1,15 @@
+id: svc-web
+name: Web frontend
+kind: service
+status: active
+env: demo-lab
+owner: ops
+updated: "2026-08-09"
+depends_on:
+  - srv-app-01
+  - svc-postgres
+endpoints:
+  - https://app.example.com
+ports:
+  - 443
+notes: Sample HTTPS frontend behind the edge host.

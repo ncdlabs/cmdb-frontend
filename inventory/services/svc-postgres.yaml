@@ -1,0 +1,14 @@
+id: svc-postgres
+name: Postgres
+kind: service
+status: active
+env: demo-lab
+owner: ops
+updated: "2026-08-09"
+depends_on:
+  - srv-db-01
+endpoints:
+  - postgres://db-01.example.com:5432
+ports:
+  - 5432
+notes: Sample database service. Do not store credentials here.

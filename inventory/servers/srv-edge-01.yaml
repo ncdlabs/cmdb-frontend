@@ -1,0 +1,35 @@
+id: srv-edge-01
+name: edge-01
+kind: server
+status: active
+env: demo-lab
+owner: ops
+updated: "2026-08-09"
+addresses:
+  ipv4: 10.0.0.10
+  hostname: edge-01
+  dns:
+    - edge-01
+    - edge-01.example.com
+    - dns.example.com
+ssh: ops@10.0.0.10
+roles:
+  - dns
+  - edge
+os:
+  name: Debian GNU/Linux
+  version: "12"
+  arch: aarch64
+hardware:
+  cpu:
+    model: Example ARM SoC
+    cores: 4
+    threads: 4
+  memory:
+    total_human: 4 GiB
+network:
+  interfaces:
+    - name: eth0
+      ipv4: 10.0.0.10/24
+      speed_mbps: 1000
+notes: Sample edge / DNS host. Not a real host.

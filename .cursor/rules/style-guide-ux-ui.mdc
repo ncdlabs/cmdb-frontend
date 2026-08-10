@@ -1,0 +1,22 @@
+---
+description: UI work must follow the in-app CMDB style guide
+globs:
+  - app/frontend/**/*.{tsx,ts,css,html}
+alwaysApply: false
+---
+
+# Style guide (CMDB browse UI)
+
+- Living guide: `/style-guide` (React route in `app/frontend/src/StyleGuidePage.tsx`).
+- Tokens and primitives: `app/frontend/src/index.css` (`--cmdb-*`), shared badges/buttons in `app/frontend/src/components.tsx`.
+- Prefer existing tokens and patterns; do not invent parallel visuals.
+- Action rows: destructive left; Cancel left of Confirm; Confirm rightmost. Cancel returns to the previous screen.
+- Forms (when present): frontend validation with field-level errors; Save disabled until dirty vs baseline and while pending.
+- Browse UI is mostly read-only. Exception: toolbar **Rescan network** may create new server YAML when inventory is writable — do not add broader edit/create CI flows without explicit approval.
+- Results list: Active / Deprecated tabs (`result-tabs`); Active = non-deprecated; no status dropdown.
+- Applications: Placement section (servers + optional k3s namespace/workloads); do not invent live pod names in inventory.
+- Machine live metrics: Refresh button only — never continuous polling of `POST /api/items/{id}/live`.
+- Network discovery: Rescan button only — never continuous polling of `POST /api/network/scan`.
+- When `CMDB_API_TOKEN` is set, toolbar **Set API token** (sessionStorage + `X-CMDB-Token`) gates Refresh / Rescan / Add; follow existing dialog + Save-until-dirty patterns.
+- Detail panel: labeled rows + pills; copy buttons for pasteable values; never raw JSON dumps.
+- Ask before removing style-guide sections or documented patterns.

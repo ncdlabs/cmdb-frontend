@@ -1,0 +1,14 @@
+.DS_Store
+**/__pycache__/
+**/*.pyc
+**/.venv/
+**/.pytest_cache/
+app/frontend/node_modules/
+app/frontend/dist/
+*.tgz
+chart/**/charts/
+.idea/
+.vscode/
+.env
+*.pem
+*.key

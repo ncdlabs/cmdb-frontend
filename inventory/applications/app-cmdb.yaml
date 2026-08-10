@@ -1,0 +1,23 @@
+id: app-cmdb
+name: CMDB frontend
+kind: application
+status: active
+env: demo-lab
+owner: ops
+updated: "2026-08-09"
+depends_on:
+  - srv-app-01
+sources:
+  - srv-app-01
+endpoints:
+  - https://cmdb.example.com
+runtime: k3s
+runs_on:
+  - srv-app-01
+k8s:
+  namespace: cmdb
+  deployments:
+    - cmdb-frontend
+  services:
+    - cmdb-frontend
+notes: This CMDB browser itself, as an example application CI.

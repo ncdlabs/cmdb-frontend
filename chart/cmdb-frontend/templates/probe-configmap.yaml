@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "cmdb-frontend.fullname" . }}-probe
+  labels:
+    {{- include "cmdb-frontend.labels" . | nindent 4 }}
+data:
+  probe.py: |
+{{ .Files.Get "files/probe.py" | indent 4 }}
+  loader.py: |
+{{ .Files.Get "files/loader.py" | indent 4 }}
+  agent_api.py: |
+{{ .Files.Get "files/agent_api.py" | indent 4 }}
+  main.py: |
+{{ .Files.Get "files/main.py" | indent 4 }}
+  scan.py: |
+{{ .Files.Get "files/scan.py" | indent 4 }}
+  addresses.py: |
+{{ .Files.Get "files/addresses.py" | indent 4 }}
+  security.py: |
+{{ .Files.Get "files/security.py" | indent 4 }}

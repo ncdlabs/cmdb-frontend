@@ -1,0 +1,124 @@
+# Default values for cmdb-frontend
+
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 1
+
+image:
+  repository: docker.io/library/cmdb
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+serviceAccount:
+  create: false
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  runAsGroup: 65534
+  fsGroup: 65534
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: true
+  className: traefik
+  host: cmdb.example.com
+  annotations: {}
+  # Traefik entrypoints
+  entrypoints:
+    web: web
+    websecure: websecure
+  tls:
+    enabled: true
+    # selfSigned | certManager | existingSecret
+    source: selfSigned
+    secretName: ""
+    certManager:
+      enabled: false
+      # Used when source=certManager (or certManager.enabled=true)
+      clusterIssuer: letsencrypt-prod
+      duration: 2160h
+      renewBefore: 360h
+  redirectHTTP: true
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+env:
+  CMDB_ROOT: /data/cmdb
+  CMDB_STATIC: /app/static
+  # Optional default SSH user when adding hosts with port 22 open (empty = omit ssh:)
+  CMDB_DEFAULT_SSH_USER: ""
+
+# Shared secret for POST /api/items/*/live, /api/network/scan, /api/network/devices.
+# Leave empty for open local/dev; set via existingSecret in production.
+apiToken:
+  existingSecret: ""
+  secretKey: token
+  # Plain value only for local charts; prefer existingSecret in real clusters
+  value: ""
+
+# Optional: use host networking so LAN IPv6 NDP (`ip -6 neigh`) sees the node neighbor table.
+hostNetwork: true
+dnsPolicy: ClusterFirstWithHostNet
+
+# Writable inventory PVC (StatefulSet). Seeded once from image /data/cmdb-seed.
+persistence:
+  enabled: true
+  mountPath: /data/cmdb
+  storageClassName: local-path
+  size: 1Gi
+  accessModes:
+    - ReadWriteOnce
+
+# Optional: mount inventory from an existing ConfigMap (only when persistence.enabled=false)
+inventory:
+  existingConfigMap: ""
+  mountPath: /data/cmdb
+
+# Optional SSH identity for manual live probes (POST /api/items/{id}/live)
+ssh:
+  existingSecret: ""
+  # Keys in the secret are mounted under /ssh; set identity filename (default id_ed25519)
+  identityFile: id_ed25519
+  mountPath: /ssh
+
+livenessProbe:
+  httpGet:
+    path: /api/health
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 20
+
+readinessProbe:
+  httpGet:
+    path: /api/health
+    port: http
+  initialDelaySeconds: 2
+  periodSeconds: 10

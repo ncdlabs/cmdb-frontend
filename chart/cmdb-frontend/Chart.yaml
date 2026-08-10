@@ -1,0 +1,6 @@
+apiVersion: v2
+name: cmdb-frontend
+description: Read-only searchable CMDB browse UI (FastAPI + React) for k3s/Traefik
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

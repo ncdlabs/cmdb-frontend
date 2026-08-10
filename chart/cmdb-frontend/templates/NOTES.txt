@@ -1,0 +1,45 @@
+CMDB frontend installed (StatefulSet).
+
+  Release:   {{ .Release.Name }}
+  Namespace: {{ .Release.Namespace }}
+  Host:      {{ .Values.ingress.host }}
+{{- if .Values.persistence.enabled }}
+
+Inventory PVC: {{ include "cmdb-frontend.fullname" . }}-inventory-data-0 (seeded once from image /data/cmdb-seed)
+{{- end }}
+
+{{- if .Values.ingress.enabled }}
+{{- if and .Values.ingress.tls.enabled (eq .Values.ingress.tls.source "selfSigned") }}
+
+TLS: self-signed certificate in Secret {{ include "cmdb-frontend.tlsSecretName" . }}
+Browsers will warn until you trust the CA or switch to cert-manager:
+
+  helm upgrade {{ .Release.Name }} ./chart/cmdb-frontend \
+    --set ingress.tls.source=certManager \
+    --set ingress.tls.certManager.enabled=true \
+    --set ingress.tls.certManager.clusterIssuer=letsencrypt-prod
+{{- else if or (eq .Values.ingress.tls.source "certManager") .Values.ingress.tls.certManager.enabled }}
+
+TLS: cert-manager Certificate → Secret {{ include "cmdb-frontend.tlsSecretName" . }}
+Issuer: {{ .Values.ingress.tls.certManager.clusterIssuer }}
+{{- else if eq .Values.ingress.tls.source "existingSecret" }}
+
+TLS: existing Secret {{ include "cmdb-frontend.tlsSecretName" . }}
+{{- end }}
+
+URLs:
+  https://{{ .Values.ingress.host }}/
+  https://{{ .Values.ingress.host }}/style-guide
+  https://{{ .Values.ingress.host }}/api/health
+  https://{{ .Values.ingress.host }}/api/auth/status
+
+{{- if or .Values.apiToken.existingSecret .Values.apiToken.value }}
+
+API token: required for live probe / LAN scan / add (set via toolbar in the UI).
+{{- else }}
+
+API token: not configured (mutating routes are open). Set apiToken.existingSecret for production.
+{{- end }}
+
+Point DNS for {{ .Values.ingress.host }} at your Traefik / k3s node(s).
+{{- end }}

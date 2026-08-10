@@ -1,0 +1,25 @@
+id: app-demo
+name: Demo app
+kind: application
+status: active
+env: demo-lab
+owner: ops
+updated: "2026-08-09"
+depends_on:
+  - svc-web
+  - svc-postgres
+sources:
+  - srv-app-01
+  - srv-db-01
+endpoints:
+  - https://app.example.com
+runtime: k3s
+runs_on:
+  - srv-app-01
+k8s:
+  namespace: demo
+  deployments:
+    - demo-web
+  services:
+    - demo-web
+notes: Sample application CI showing placement fields.

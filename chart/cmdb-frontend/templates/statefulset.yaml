@@ -1,0 +1,193 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "cmdb-frontend.fullname" . }}
+  labels:
+    {{- include "cmdb-frontend.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "cmdb-frontend.fullname" . }}
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "cmdb-frontend.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cmdb-frontend.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.serviceAccount.create }}
+      serviceAccountName: {{ default (include "cmdb-frontend.fullname" .) .Values.serviceAccount.name }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if .Values.hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: {{ .Values.dnsPolicy | default "ClusterFirstWithHostNet" | quote }}
+      {{- end }}
+      {{- if .Values.persistence.enabled }}
+      initContainers:
+        - name: seed-inventory
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              if [ ! -f /data/cmdb/index.yaml ]; then
+                echo "Seeding inventory PVC from /data/cmdb-seed"
+                cp -a /data/cmdb-seed/. /data/cmdb/
+              else
+                echo "Inventory PVC already seeded"
+              fi
+              chown -R 65534:65534 /data/cmdb || true
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - CHOWN
+                - FOWNER
+                - DAC_OVERRIDE
+          volumeMounts:
+            - name: inventory-data
+              mountPath: /data/cmdb
+      {{- end }}
+      containers:
+        - name: cmdb
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+          env:
+            {{- range $key, $value := .Values.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            {{- if .Values.ssh.existingSecret }}
+            - name: CMDB_SSH_DIR
+              value: {{ .Values.ssh.mountPath | quote }}
+            - name: CMDB_SSH_IDENTITY
+              value: {{ printf "%s/%s" .Values.ssh.mountPath .Values.ssh.identityFile | quote }}
+            {{- end }}
+            {{- if .Values.apiToken.existingSecret }}
+            - name: CMDB_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.apiToken.existingSecret | quote }}
+                  key: {{ .Values.apiToken.secretKey | quote }}
+            {{- else if .Values.apiToken.value }}
+            - name: CMDB_API_TOKEN
+              value: {{ .Values.apiToken.value | quote }}
+            {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: probe
+              mountPath: /app/cmdb_api/probe.py
+              subPath: probe.py
+              readOnly: true
+            - name: probe
+              mountPath: /app/cmdb_api/loader.py
+              subPath: loader.py
+              readOnly: true
+            - name: probe
+              mountPath: /app/cmdb_api/agent_api.py
+              subPath: agent_api.py
+              readOnly: true
+            - name: probe
+              mountPath: /app/cmdb_api/main.py
+              subPath: main.py
+              readOnly: true
+            - name: probe
+              mountPath: /app/cmdb_api/scan.py
+              subPath: scan.py
+              readOnly: true
+            - name: probe
+              mountPath: /app/cmdb_api/addresses.py
+              subPath: addresses.py
+              readOnly: true
+            - name: probe
+              mountPath: /app/cmdb_api/security.py
+              subPath: security.py
+              readOnly: true
+            {{- if .Values.persistence.enabled }}
+            - name: inventory-data
+              mountPath: {{ .Values.persistence.mountPath }}
+            {{- else if .Values.inventory.existingConfigMap }}
+            - name: inventory
+              mountPath: {{ .Values.inventory.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.ssh.existingSecret }}
+            - name: ssh
+              mountPath: {{ .Values.ssh.mountPath }}
+              readOnly: true
+            {{- end }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: probe
+          configMap:
+            name: {{ include "cmdb-frontend.fullname" . }}-probe
+      {{- if and (not .Values.persistence.enabled) .Values.inventory.existingConfigMap }}
+        - name: inventory
+          configMap:
+            name: {{ .Values.inventory.existingConfigMap }}
+      {{- end }}
+      {{- if .Values.ssh.existingSecret }}
+        - name: ssh
+          secret:
+            secretName: {{ .Values.ssh.existingSecret }}
+            defaultMode: 0400
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: inventory-data
+        labels:
+          {{- include "cmdb-frontend.selectorLabels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- if .Values.persistence.storageClassName }}
+        storageClassName: {{ .Values.persistence.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size | quote }}
+  {{- end }}

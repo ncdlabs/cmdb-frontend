@@ -1,0 +1,13 @@
+.git
+.cursor
+**/node_modules
+**/__pycache__
+**/.venv
+**/.pytest_cache
+app/frontend/dist
+*.pyc
+.DS_Store
+**/._*
+**/.*.yaml
+chart/**/charts
+chart/**/*.tgz

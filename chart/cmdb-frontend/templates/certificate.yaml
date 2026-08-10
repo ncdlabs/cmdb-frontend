@@ -1,0 +1,17 @@
+{{- if and .Values.ingress.enabled .Values.ingress.tls.enabled (or (eq .Values.ingress.tls.source "certManager") .Values.ingress.tls.certManager.enabled) }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "cmdb-frontend.fullname" . }}
+  labels:
+    {{- include "cmdb-frontend.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "cmdb-frontend.tlsSecretName" . }}
+  duration: {{ .Values.ingress.tls.certManager.duration | quote }}
+  renewBefore: {{ .Values.ingress.tls.certManager.renewBefore | quote }}
+  dnsNames:
+    - {{ .Values.ingress.host | quote }}
+  issuerRef:
+    name: {{ .Values.ingress.tls.certManager.clusterIssuer }}
+    kind: ClusterIssuer
+{{- end }}

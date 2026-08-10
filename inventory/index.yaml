@@ -1,0 +1,49 @@
+# Sample index — optional; the loader indexes *.yaml under kind directories.
+# Replace this tree with your own CMDB before deploying.
+updated: "2026-08-09"
+counts:
+  servers: 3
+  services: 2
+  applications: 2
+  environments: 1
+items:
+  - id: env-demo-lab
+    kind: environment
+    name: Demo lab
+    path: environments/env-demo-lab.yaml
+    status: active
+  - id: srv-app-01
+    kind: server
+    name: app-01
+    path: servers/srv-app-01.yaml
+    status: active
+  - id: srv-db-01
+    kind: server
+    name: db-01
+    path: servers/srv-db-01.yaml
+    status: active
+  - id: srv-edge-01
+    kind: server
+    name: edge-01
+    path: servers/srv-edge-01.yaml
+    status: active
+  - id: svc-web
+    kind: service
+    name: Web frontend
+    path: services/svc-web.yaml
+    status: active
+  - id: svc-postgres
+    kind: service
+    name: Postgres
+    path: services/svc-postgres.yaml
+    status: active
+  - id: app-demo
+    kind: application
+    name: Demo app
+    path: applications/app-demo.yaml
+    status: active
+  - id: app-cmdb
+    kind: application
+    name: CMDB frontend
+    path: applications/app-cmdb.yaml
+    status: active

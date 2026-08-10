@@ -1,0 +1,45 @@
+id: srv-app-01
+name: app-01
+kind: server
+status: active
+env: demo-lab
+owner: ops
+updated: "2026-08-09"
+addresses:
+  ipv4: 10.0.0.20
+  hostname: app-01
+  dns:
+    - app-01
+    - app-01.example.com
+ssh: ops@10.0.0.20
+roles:
+  - app
+  - k3s
+os:
+  name: Debian GNU/Linux
+  version: "12"
+  arch: amd64
+hardware:
+  cpu:
+    model: Example CPU
+    cores: 4
+    threads: 8
+  memory:
+    total_human: 16 GiB
+  disks:
+    - device: /dev/sda
+      size_human: 100 GiB
+network:
+  interfaces:
+    - name: eth0
+      ipv4: 10.0.0.20/24
+      speed_mbps: 1000
+k3s:
+  desired:
+    member: true
+    role: server
+  observed:
+    ready: true
+    role: server
+    node_name: app-01
+notes: Sample application node. Not a real host.

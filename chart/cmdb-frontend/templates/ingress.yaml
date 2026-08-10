@@ -1,0 +1,72 @@
+{{- if .Values.ingress.enabled }}
+{{- $fullName := include "cmdb-frontend.fullname" . }}
+{{- $tlsEnabled := and .Values.ingress.tls.enabled (ne .Values.ingress.tls.source "") }}
+---
+# HTTPS ingress (primary)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}
+  labels:
+    {{- include "cmdb-frontend.labels" . | nindent 4 }}
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: {{ .Values.ingress.entrypoints.websecure }}
+    {{- if $tlsEnabled }}
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- end }}
+    {{- if and $tlsEnabled (or (eq .Values.ingress.tls.source "certManager") .Values.ingress.tls.certManager.enabled) }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.certManager.clusterIssuer | quote }}
+    {{- end }}
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- end }}
+  {{- if $tlsEnabled }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host | quote }}
+      secretName: {{ include "cmdb-frontend.tlsSecretName" . }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}
+                port:
+                  name: http
+{{- if and $tlsEnabled .Values.ingress.redirectHTTP }}
+---
+# HTTP ingress → HTTPS redirect
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-http
+  labels:
+    {{- include "cmdb-frontend.labels" . | nindent 4 }}
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: {{ .Values.ingress.entrypoints.web }}
+    traefik.ingress.kubernetes.io/router.middlewares: {{ .Release.Namespace }}-{{ $fullName }}-https-redirect@kubernetescrd
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}
+                port:
+                  name: http
+{{- end }}
+{{- end }}
