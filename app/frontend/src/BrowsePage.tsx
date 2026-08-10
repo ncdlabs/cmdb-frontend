@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
   ApiAuthError,
@@ -23,10 +23,18 @@ import {
   HumanValue,
   KindBadge,
   PillList,
+  ReachabilityBadge,
   StatusBadge,
 } from './components'
 import { ApiTokenDialog } from './components/ApiTokenDialog'
 import { NetworkRescanDialog } from './components/NetworkRescanDialog'
+import {
+  clearCachedLiveProbe,
+  getCachedLiveProbe,
+  isProbeableServer,
+  setCachedLiveProbe,
+  useReachability,
+} from './liveProbeCache'
 
 const KINDS = ['server', 'service', 'application', 'environment']
 
@@ -323,6 +331,7 @@ export function BrowsePage() {
                         <span>{item.name || item.id}</span>
                         <KindBadge kind={item.kind} />
                         <StatusBadge status={item.status} />
+                        <CiReachabilityPill item={item} />
                       </div>
                       <div className="ci-row-meta">
                         <span className="mono">{item.id}</span>
@@ -427,6 +436,12 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return null
 }
 
+function CiReachabilityPill({ item }: { item: { id: string; kind?: string; ssh?: string } }) {
+  const reach = useReachability(item.id)
+  if (!isProbeableServer(item)) return null
+  return <ReachabilityBadge state={reach} />
+}
+
 function MachineSection({
   item,
   onAuthRequired,
@@ -437,12 +452,9 @@ function MachineSection({
   const [live, setLive] = useState<LiveProbe | null>(null)
   const [probing, setProbing] = useState(false)
   const [probeError, setProbeError] = useState<string | null>(null)
-
-  useEffect(() => {
-    setLive(null)
-    setProbeError(null)
-    setProbing(false)
-  }, [item.id])
+  const onAuthRequiredRef = useRef(onAuthRequired)
+  onAuthRequiredRef.current = onAuthRequired
+  const probingRef = useRef(false)
 
   const os = asRecord(item.os)
   const hardware = asRecord(item.hardware)
@@ -459,28 +471,95 @@ function MachineSection({
       ? hardware.storage
       : null
   const interfaces = Array.isArray(network?.interfaces) ? network.interfaces : null
-  const canProbe = item.kind === 'server' && Boolean(item.ssh)
+  const canProbe = isProbeableServer(item)
 
-  async function onRefresh() {
-    if (!canProbe || probing) return
+  async function runProbe(force: boolean) {
+    if (!canProbe || probingRef.current) return
+    if (!force) {
+      const cached = getCachedLiveProbe(item.id)
+      if (cached) {
+        setLive(cached.result)
+        setProbeError(cached.result.ok ? null : cached.result.error || 'Probe failed')
+        return
+      }
+    }
+    probingRef.current = true
     setProbing(true)
     setProbeError(null)
     try {
       const result = await fetchLiveProbe(item.id)
+      setCachedLiveProbe(item.id, result)
       setLive(result)
       if (!result.ok) setProbeError(result.error || 'Probe failed')
     } catch (err) {
       setLive(null)
+      clearCachedLiveProbe(item.id)
       if (err instanceof ApiAuthError) {
         setProbeError(err.message)
-        onAuthRequired?.()
+        onAuthRequiredRef.current?.()
       } else {
         setProbeError(err instanceof Error ? err.message : String(err))
       }
     } finally {
+      probingRef.current = false
       setProbing(false)
     }
   }
+
+  useEffect(() => {
+    let cancelled = false
+
+    const cached = getCachedLiveProbe(item.id)
+    if (cached) {
+      setLive(cached.result)
+      setProbeError(cached.result.ok ? null : cached.result.error || 'Probe failed')
+      setProbing(false)
+      probingRef.current = false
+      return () => {
+        cancelled = true
+      }
+    }
+
+    setLive(null)
+    setProbeError(null)
+    setProbing(false)
+    probingRef.current = false
+    if (!canProbe) {
+      return () => {
+        cancelled = true
+      }
+    }
+
+    probingRef.current = true
+    setProbing(true)
+    fetchLiveProbe(item.id)
+      .then((result) => {
+        if (cancelled) return
+        setCachedLiveProbe(item.id, result)
+        setLive(result)
+        if (!result.ok) setProbeError(result.error || 'Probe failed')
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return
+        setLive(null)
+        clearCachedLiveProbe(item.id)
+        if (err instanceof ApiAuthError) {
+          setProbeError(err.message)
+          onAuthRequiredRef.current?.()
+        } else {
+          setProbeError(err instanceof Error ? err.message : String(err))
+        }
+      })
+      .finally(() => {
+        if (cancelled) return
+        probingRef.current = false
+        setProbing(false)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [item.id, canProbe])
 
   const showMachine =
     item.kind === 'server' ||
@@ -499,14 +578,21 @@ function MachineSection({
       <div className="machine-header">
         <h4 className="machine-title">Machine</h4>
         {canProbe ? (
-          <button type="button" className="btn btn-secondary" onClick={onRefresh} disabled={probing}>
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => void runProbe(true)}
+            disabled={probing}
+          >
             {probing ? 'Probing…' : 'Refresh'}
           </button>
         ) : null}
       </div>
       <p className="machine-hint">
         Static specs come from inventory YAML (desired vs last observed).
-        {canProbe ? ' Refresh runs a one-shot SSH probe — never polled automatically.' : null}
+        {canProbe
+          ? ' Selecting a server SSH-probes when live data is older than 5 minutes (or missing). Refresh forces a new probe. Never polled on an interval.'
+          : null}
       </p>
 
       {k3s ? (
@@ -991,6 +1077,7 @@ function CiDetailView({
           <div className="detail-badges">
             <KindBadge kind={item.kind} />
             <StatusBadge status={item.status} />
+            <CiReachabilityPill item={item} />
             {item.runtime === 'k3s' || placement?.runtime === 'k3s' ? (
               <span className="badge badge-k3s">k3s</span>
             ) : null}

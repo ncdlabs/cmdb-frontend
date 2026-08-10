@@ -255,6 +255,86 @@ class TestApiRoutes:
         # SSH may fail in CI; auth must succeed (not 401).
         assert allowed.status_code != 401
 
+    def test_live_probe_persist_writes_specs_on_success(
+        self, client: TestClient, inventory_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        live = {
+            "os": {"name": "Debian GNU/Linux", "version": "13", "arch": "amd64"},
+            "cpu": {"model": "Test CPU", "cores": 2, "threads": 4},
+            "memory": {"total_bytes": 8589934592, "total_human": "8.0 GiB"},
+            "physical_disks": [
+                {
+                    "device": "/dev/sda",
+                    "model": "TEST-SSD",
+                    "serial": "SERIAL1",
+                    "capacity_bytes": 100000000000,
+                    "capacity_human": "93.1 GiB",
+                    "interface": "sata",
+                    "rotational": False,
+                }
+            ],
+            "nics": [
+                {
+                    "name": "eth0",
+                    "mac": "02:00:00:00:00:01",
+                    "speed_mbps": 1000,
+                    "duplex": "full",
+                    "mtu": 1500,
+                    "ipv4": ["10.0.0.20/24"],
+                }
+            ],
+        }
+
+        def fake_probe(_ssh: str, timeout: int = 30) -> dict:
+            return {
+                "ok": True,
+                "probed_at": "2026-08-10T00:00:00+00:00",
+                "ssh": _ssh,
+                "error": None,
+                "live": live,
+            }
+
+        import cmdb_api.main as main_mod
+
+        monkeypatch.setattr(main_mod, "probe_host", fake_probe)
+        res = client.post("/api/items/srv-test/live", params={"persist": "true"})
+        assert res.status_code == 200
+        body = res.json()
+        assert body["ok"] is True
+        assert body["persisted"] is True
+        assert "hardware" in body["applied"]["fields"]
+        yaml_text = (inventory_root / "servers" / "srv-test.yaml").read_text(encoding="utf-8")
+        assert "Test CPU" in yaml_text
+        assert "Debian GNU/Linux" in yaml_text
+        assert "status: active" in yaml_text
+        detail = client.get("/api/items/srv-test").json()
+        assert detail["hardware"]["cpu"]["model"] == "Test CPU"
+        assert detail["os"]["name"] == "Debian GNU/Linux"
+
+    def test_live_probe_persist_skips_write_on_failure(
+        self, client: TestClient, inventory_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fake_probe(_ssh: str, timeout: int = 30) -> dict:
+            return {
+                "ok": False,
+                "probed_at": "2026-08-10T00:00:00+00:00",
+                "ssh": _ssh,
+                "error": "connection refused",
+                "live": None,
+            }
+
+        import cmdb_api.main as main_mod
+
+        monkeypatch.setattr(main_mod, "probe_host", fake_probe)
+        before = (inventory_root / "servers" / "srv-test.yaml").read_text(encoding="utf-8")
+        res = client.post("/api/items/srv-test/live", params={"persist": "true"})
+        assert res.status_code == 200
+        body = res.json()
+        assert body["ok"] is False
+        assert body["persisted"] is False
+        after = (inventory_root / "servers" / "srv-test.yaml").read_text(encoding="utf-8")
+        assert after == before
+
     def test_bearer_auth_accepted(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:

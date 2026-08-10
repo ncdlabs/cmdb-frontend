@@ -5,12 +5,14 @@ from __future__ import annotations
 import os
 import threading
 import time
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from cmdb_api.addresses import AddressExtractor
+from cmdb_api.probe import static_hardware_from_live
 from cmdb_api.scan import (
     build_server_document,
     collect_inventory_hostnames,
@@ -377,6 +379,88 @@ class CmdbStore:
             return True
         except OSError:
             return False
+
+    def apply_observed_specs(self, item_id: str, live: dict[str, Any]) -> dict[str, Any]:
+        """Write hardware/os/network from a successful probe into server YAML, then reload.
+
+        Does not change ``status`` (lifecycle). Live gauges (load, used RAM, temp)
+        are intentionally not stored — only static observed specs.
+        """
+        if not self.inventory_writable():
+            raise PermissionError(
+                f"Inventory is not writable at {self.root} "
+                "(need a writable PVC/bind-mount for /data/cmdb)"
+            )
+        if not isinstance(live, dict) or not live:
+            raise ValueError("live probe payload is empty")
+
+        with self._lock:
+            item = self._items.get(item_id)
+            if not item:
+                raise KeyError(item_id)
+            if item.get("kind") != "server":
+                raise ValueError("Observed specs can only be applied to servers")
+            rel = str(item.get("path") or "")
+            if not rel or rel.startswith("/") or ".." in Path(rel).parts:
+                raise ValueError(f"Server has no safe inventory path: {item_id}")
+
+        path = (self.root / rel).resolve()
+        if not path.is_file() or not str(path).startswith(str(self.root.resolve())):
+            raise FileNotFoundError(f"Inventory file missing: {rel}")
+
+        blocks = static_hardware_from_live(live)
+        observed_at = (
+            datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        )
+        hardware = blocks.get("hardware") or {}
+        for disk in hardware.get("disks") or []:
+            if isinstance(disk, dict):
+                disk.setdefault("source", "ssh-probe")
+                disk["observed_at"] = observed_at
+                disk.setdefault("confidence", "high")
+        for fs in hardware.get("filesystems") or []:
+            if isinstance(fs, dict):
+                fs.setdefault("source", "ssh-probe")
+                fs["observed_at"] = observed_at
+        network = blocks.get("network")
+        if isinstance(network, dict):
+            for iface in network.get("interfaces") or []:
+                if isinstance(iface, dict):
+                    iface.setdefault("source", "ssh-probe")
+                    iface["observed_at"] = observed_at
+                    iface.setdefault("confidence", "high")
+
+        fields: list[str] = []
+        with self._lock:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            if not isinstance(raw, dict):
+                raise ValueError(f"Inventory root is not a mapping: {rel}")
+            doc = dict(raw)
+            if hardware:
+                doc["hardware"] = hardware
+                fields.append("hardware")
+            os_block = blocks.get("os") or {}
+            if os_block:
+                doc["os"] = os_block
+                fields.append("os")
+            if network:
+                doc["network"] = network
+                fields.append("network")
+            if not fields:
+                raise ValueError("Probe produced no hardware/os/network to persist")
+            doc["updated"] = date.today().isoformat()
+            fields.append("updated")
+            with path.open("w", encoding="utf-8") as handle:
+                yaml.safe_dump(doc, handle, sort_keys=False, default_flow_style=False)
+            self.reload()
+
+        return {
+            "id": item_id,
+            "path": rel,
+            "updated": doc["updated"],
+            "observed_at": observed_at,
+            "fields": fields,
+        }
 
     def create_servers_from_scan(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
         """Write new server YAML files from LAN-scan selections, then reload."""
@@ -886,4 +970,7 @@ class CmdbStore:
             summary["runtime"] = runtime
         elif isinstance(item.get("k8s"), dict):
             summary["runtime"] = "k3s"
+        ssh = item.get("ssh")
+        if isinstance(ssh, str) and ssh.strip():
+            summary["ssh"] = ssh.strip()
         return summary

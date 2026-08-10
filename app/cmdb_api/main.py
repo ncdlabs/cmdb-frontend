@@ -16,7 +16,7 @@ from cmdb_api.agent_api import build_agent_router
 from cmdb_api.loader import CmdbStore, default_cmdb_root
 from cmdb_api.probe import probe_host
 from cmdb_api.scan import scan_subnets
-from cmdb_api.security import StaticPathResolver, require_api_token, active_guard
+from cmdb_api.security import StaticPathResolver, active_guard, require_api_token
 
 STORE = CmdbStore(root=default_cmdb_root())
 _SCAN_LOCK = threading.Lock()
@@ -28,6 +28,7 @@ app = FastAPI(
         "Configuration management database. "
         "Browse UI uses `/api/items*`. "
         "LAN rescan (manual) writes new server YAML when inventory is writable. "
+        "Optional live-probe persist writes hardware/os/network into server YAML. "
         "Mutating routes (live probe, network scan/add) require `CMDB_API_TOKEN` "
         "when that env var is set (`X-CMDB-Token` or Bearer). "
         "LLM/tool agents should prefer `/api/agent/*` "
@@ -102,12 +103,22 @@ def get_item(item_id: str) -> dict:
 @app.post(
     "/api/items/{item_id}/live",
     tags=["browse"],
-    summary="One-shot SSH live probe (UI Refresh only)",
-    description="Never call on an interval. Not part of the agent API / MCP tools.",
+    summary="One-shot SSH live probe",
+    description=(
+        "Never call on an interval. Not part of the agent API / MCP tools. "
+        "UI Refresh omits persist. With persist=true, successful probes write "
+        "static hardware/os/network into inventory YAML (not live gauges; status unchanged)."
+    ),
     dependencies=[Depends(require_api_token)],
 )
-def probe_item_live(item_id: str) -> dict:
-    """One-shot SSH probe. Never polled automatically — UI Refresh only."""
+def probe_item_live(
+    item_id: str,
+    persist: bool = Query(
+        False,
+        description="Write hardware/os/network from a successful probe into inventory YAML",
+    ),
+) -> dict:
+    """One-shot SSH probe. Never polled automatically — UI Refresh only (persist off)."""
     item = STORE.get_item(item_id)
     if not item:
         raise HTTPException(status_code=404, detail=f"CI not found: {item_id}")
@@ -119,7 +130,22 @@ def probe_item_live(item_id: str) -> dict:
             status_code=400,
             detail="Server has no ssh field — add ssh: user@host to the inventory CI",
         )
-    return probe_host(ssh)
+    result = probe_host(ssh)
+    if not persist:
+        return result
+    if not result.get("ok") or not isinstance(result.get("live"), dict):
+        return {**result, "persisted": False}
+    try:
+        applied = STORE.apply_observed_specs(item_id, result["live"])
+    except PermissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"CI not found: {item_id}") from exc
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to write inventory: {exc}") from exc
+    return {**result, "persisted": True, "applied": applied}
 
 
 @app.post(

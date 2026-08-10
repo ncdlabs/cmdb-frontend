@@ -381,6 +381,24 @@ code,
   border-color: #a8bdd9;
 }
 
+.badge-online {
+  background: var(--cmdb-accent-soft);
+  color: var(--cmdb-ok);
+  border-color: #9ecfbe;
+}
+
+.badge-offline {
+  background: #f6e4e4;
+  color: var(--cmdb-danger);
+  border-color: #e2b4b4;
+}
+
+.badge-reach-unknown {
+  background: #e8ecea;
+  color: var(--cmdb-unknown);
+  border-color: var(--cmdb-border);
+}
+
 .placement-hint {
   color: var(--cmdb-ink-muted);
 }

@@ -12,6 +12,8 @@ export type CiSummary = {
   missing?: boolean
   runtime?: string
   placement_summary?: string
+  /** Present on probeable servers (list + detail). */
+  ssh?: string
 }
 
 export type K8sPlacement = {
@@ -33,7 +35,6 @@ export type Placement = {
 
 export type CiDetail = CiSummary & {
   notes?: string
-  ssh?: string
   roles?: string[]
   sources?: string[]
   depends_on?: string[]
@@ -248,7 +249,7 @@ export function fetchItem(id: string): Promise<CiDetail> {
   return getJson<CiDetail>(`/api/items/${encodeURIComponent(id)}`)
 }
 
-/** Manual one-shot SSH probe — never call on an interval. */
+/** One-shot SSH probe. UI may call on server select when client TTL elapsed; never on an interval. */
 export function fetchLiveProbe(id: string): Promise<LiveProbe> {
   return getJson<LiveProbe>(`/api/items/${encodeURIComponent(id)}/live`, { method: 'POST' })
 }

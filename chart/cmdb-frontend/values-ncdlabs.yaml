@@ -1,0 +1,28 @@
+# Cluster override for ncdLabs cmdb deployment.
+# Usage:
+#   helm upgrade cmdb-frontend ./chart/cmdb-frontend -n cmdb -f chart/cmdb-frontend/values-ncdlabs.yaml
+#
+# Prefer this file over bare `--set` so SSH secret + ingress host are not wiped.
+
+dnsPolicy: ClusterFirstWithHostNet
+hostNetwork: true
+
+image:
+  pullPolicy: IfNotPresent
+  repository: docker.io/library/cmdb
+  tag: latest
+
+nodeSelector:
+  kubernetes.io/hostname: k3s1
+
+persistence:
+  enabled: true
+  size: 1Gi
+  storageClassName: local-path
+
+ingress:
+  host: cmdb.ncdlabs.com
+
+ssh:
+  existingSecret: cmdb-ssh
+  identityFile: id_ed25519

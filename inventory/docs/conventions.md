@@ -63,7 +63,12 @@ hardware:
 
 Legacy `hardware.storage` (mount rows) is deprecated — migrate to `filesystems`. UI still reads `storage` as a fallback.
 
-Live metrics (load, RAM used, temperature, uptime, fresh SMART/NIC gauges) are **not** auto-written into YAML. The browse UI loads them only when you click **Refresh** (`POST /api/items/{id}/live`).
+Live metrics (load, RAM used, temperature, uptime, fresh SMART/NIC gauges) are **not** auto-written into YAML.
+The browse UI loads them via `POST /api/items/{id}/live` when you open a probeable server and the client-side live
+cache is older than **5 minutes** (or missing), and when you click **Refresh** (always forces a new probe).
+Never poll on an interval.
+
+Optional one-shot enrichment: `POST /api/items/{id}/live?persist=true` writes static **hardware / os / network** (plus `updated`) from a successful probe into the server YAML and reloads the store. It does **not** change `status`, and it never stores live gauges. Never poll this on an interval; not an agent/MCP tool.
 
 ## LAN rescan
 

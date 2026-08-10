@@ -14,6 +14,17 @@ export function StatusBadge({ status }: { status?: string }) {
   return <span className={`badge ${cls}`}>{value}</span>
 }
 
+export function ReachabilityBadge({ state }: { state: 'online' | 'offline' | 'unknown' }) {
+  const cls =
+    state === 'online' ? 'badge-online' : state === 'offline' ? 'badge-offline' : 'badge-reach-unknown'
+  const label = state === 'online' ? 'Online' : state === 'offline' ? 'Offline' : 'Unknown'
+  return (
+    <span className={`badge ${cls}`} title={`SSH reachability: ${label}`}>
+      {label}
+    </span>
+  )
+}
+
 export function KindBadge({ kind }: { kind?: string }) {
   return <span className="badge badge-kind">{kind || 'unknown'}</span>
 }

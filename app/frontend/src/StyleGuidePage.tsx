@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from 'react'
 import { Link } from 'react-router-dom'
-import { Copyable, DriveInfoTip, KindBadge, PillList, StatusBadge } from './components'
+import { Copyable, DriveInfoTip, KindBadge, PillList, ReachabilityBadge, StatusBadge } from './components'
 
 const SWATCHES = [
   { name: 'Canvas', varName: '--cmdb-canvas', hex: '#dfe6e2', usage: 'Page background' },
@@ -176,8 +176,16 @@ export function StyleGuidePage() {
             <StatusBadge status="planned" />
             <StatusBadge status="deprecated" />
             <StatusBadge status="unknown" />
+            <ReachabilityBadge state="online" />
+            <ReachabilityBadge state="offline" />
+            <ReachabilityBadge state="unknown" />
             <span className="badge badge-k3s">k3s</span>
           </div>
+          <p style={{ marginTop: '0.75rem' }}>
+            <strong>Online</strong> / <strong>Offline</strong> / <strong>Unknown</strong> are SSH reachability pills for
+            probeable servers. They come from the last live probe in this browser session (5-minute TTL). Unknown means not
+            probed yet (or cache expired). Not the same as inventory <code>status</code> (active / deprecated).
+          </p>
         </section>
 
         <section className="sg-section" id="sg-tabs" data-testid="sg-tabs">
@@ -274,7 +282,9 @@ export function StyleGuidePage() {
             <code>hardware.disks</code> (separate from <code>filesystems</code>), negotiated NIC speed under{' '}
             <code>network.interfaces</code>, plus static <code>os</code>/<code>hardware</code> from YAML. Optional{' '}
             <strong>Refresh</strong> runs a one-shot SSH probe (load, RAM, temp, physical disks, NICs, filesystem usage).
-            Never poll live metrics on an interval. Do not auto-write probe results into inventory YAML.
+            Opening a probeable server auto-probes when the client-side live cache is older than 5 minutes (or missing).
+            Never poll live metrics on an interval. Live results stay ephemeral in the UI. Optional API
+            persist (<code>?persist=true</code>) may write static hardware/os/network only.
           </p>
           <div className="demo-row" style={{ marginTop: '1rem' }}>
             <span className="mono">eth0 · 1000 Mb/s · full · 10.0.0.20/24</span>
@@ -304,7 +314,7 @@ export function StyleGuidePage() {
               </button>
             </div>
             <p className="machine-hint">
-              Static specs come from inventory YAML (desired vs last observed). Refresh runs a one-shot SSH probe.
+              Static specs come from inventory YAML (desired vs last observed). Select auto-probes when live cache is older than 5 minutes; Refresh forces a new probe.
             </p>
             <div className="kv">
               <div className="kv-row">
