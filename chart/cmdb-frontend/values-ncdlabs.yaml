@@ -4,16 +4,17 @@
 #
 # Prefer this file over bare `--set` so SSH secret + ingress host are not wiped.
 
-dnsPolicy: ClusterFirstWithHostNet
-hostNetwork: true
+# Cluster Service IP (not hostNetwork) so Traefik on other nodes can reach the pod.
+# hostNetwork: true only if you need LAN IPv6 NDP and have opened the host port to Traefik nodes.
+hostNetwork: false
 
 image:
   pullPolicy: IfNotPresent
   repository: docker.io/library/cmdb
   tag: latest
 
-nodeSelector:
-  kubernetes.io/hostname: k3s1
+# Do not hostname-pin. local-path PV already binds data to a node.
+nodeSelector: {}
 
 persistence:
   enabled: true
@@ -22,6 +23,11 @@ persistence:
 
 ingress:
   host: cmdb.ncdlabs.com
+  tls:
+    source: certManager
+    certManager:
+      enabled: true
+      clusterIssuer: letsencrypt-cloudflare-production
 
 ssh:
   existingSecret: cmdb-ssh

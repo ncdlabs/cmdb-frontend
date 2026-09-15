@@ -2,6 +2,22 @@
 
 Read-only searchable CMDB browser (FastAPI + React). Inventory YAML is baked into the image from `inventory/` (replace the sample data with your own source of truth before deploying).
 
+## Screenshots
+
+Inventory values are blurred in these captures (hostnames, IPs, env names, detail fields).
+
+### Browse
+
+![Browse overview — results list and empty detail panel](docs/screenshots/browse-overview.jpg)
+
+Active / Deprecated tabs, search + kind/env filters, and **Rescan network**.
+
+### CI detail
+
+![CI detail — selected item with blurred inventory fields](docs/screenshots/ci-detail.jpg)
+
+Split layout: results on the left, labeled detail rows on the right.
+
 ## Layout
 
 | Path | Purpose |

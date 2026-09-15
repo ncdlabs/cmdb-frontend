@@ -84,9 +84,10 @@ apiToken:
   # Plain value only for local charts; prefer existingSecret in real clusters
   value: ""
 
-# Optional: use host networking so LAN IPv6 NDP (`ip -6 neigh`) sees the node neighbor table.
-hostNetwork: true
-dnsPolicy: ClusterFirstWithHostNet
+# hostNetwork: false so Traefik/cluster Service routing works. Set true only if you need LAN IPv6 NDP (`ip -6 neigh`) and can reach the host port from Traefik nodes.
+hostNetwork: false
+# dnsPolicy only applies when hostNetwork is true
+# dnsPolicy: ClusterFirstWithHostNet
 
 # Writable inventory PVC (StatefulSet). Seeded once from image /data/cmdb-seed.
 persistence:
@@ -115,6 +116,8 @@ livenessProbe:
     port: http
   initialDelaySeconds: 5
   periodSeconds: 20
+  timeoutSeconds: 3
+  failureThreshold: 3
 
 readinessProbe:
   httpGet:
@@ -122,3 +125,5 @@ readinessProbe:
     port: http
   initialDelaySeconds: 2
   periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3

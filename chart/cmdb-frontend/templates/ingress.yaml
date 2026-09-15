@@ -14,7 +14,7 @@ metadata:
     {{- if $tlsEnabled }}
     traefik.ingress.kubernetes.io/router.tls: "true"
     {{- end }}
-    {{- if and $tlsEnabled (or (eq .Values.ingress.tls.source "certManager") .Values.ingress.tls.certManager.enabled) }}
+    {{- if and $tlsEnabled (or (eq .Values.ingress.tls.source "certManager") .Values.ingress.tls.certManager.enabled) (not (eq .Values.ingress.tls.source "certManager")) }}
     cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.certManager.clusterIssuer | quote }}
     {{- end }}
     {{- with .Values.ingress.annotations }}

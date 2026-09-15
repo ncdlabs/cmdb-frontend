@@ -2,6 +2,14 @@
 
 ## Last updated
 
+2026-09-14 (`hostNetwork: false` — Traefik on other nodes could not reach hostNetwork endpoint; HTTPS 504 fixed)
+
+2026-09-14 (README screenshots in `docs/screenshots/` — live UI with inventory data blurred)
+
+2026-08-17 (TLS: cert-manager `letsencrypt-cloudflare-production` in `values-ncdlabs.yaml`; ingress-shim annotation disabled when explicit Certificate is used)
+
+2026-08-13 (unpinned `kubernetes.io/hostname` in `values-ncdlabs.yaml` + live STS; PV affinity keeps inventory on disk node)
+
 2026-08-10 (Online/Offline reachability pills from probe cache)
 
 ## Architecture
@@ -13,7 +21,7 @@
 - Reachability pills: **Online** / **Offline** / **Unknown** on probeable servers (list + detail) from that client probe cache (not inventory status)
 - Optional persist: `POST /api/items/{id}/live?persist=true` writes static hardware/os/network (+ `updated`) into server YAML; never status; never live gauges
 - LAN discovery: `app/cmdb_api/scan.py` — IPv4 sweep (capped ≤1024 hosts/prefix) + IPv6 NDP/AAAA (no /64 brute-force); Rescan → `POST /api/network/scan` + `POST /api/network/devices`
-- Chart can use `hostNetwork: true` + `dnsPolicy: ClusterFirstWithHostNet` so NDP sees node LAN neighbors
+- Default `hostNetwork: false` so Traefik/Service routing works cross-node; optional `hostNetwork: true` + `dnsPolicy: ClusterFirstWithHostNet` only for LAN IPv6 NDP (and only if host:8080 is reachable from Traefik nodes)
 - Probe/loader/agent_api/main/scan shipped via Helm ConfigMap `cmdb-frontend-probe` (mount over `/app/cmdb_api/*.py`)
 - Browse list: Active / Deprecated tabs; URL `?tab=deprecated`
 - Applications: `placement` API field — servers from `runs_on`/`depends_on`, plus optional `runtime: k3s` + `k8s:` workloads
@@ -44,11 +52,13 @@
 - Helm: `helm upgrade cmdb-frontend ./chart/cmdb-frontend -n cmdb -f chart/cmdb-frontend/values-ncdlabs.yaml`
 - Style guide: `/style-guide`
 - Conventions: `inventory/docs/conventions.md`
+- README screenshots: `docs/screenshots/` (blurred inventory)
 
 ## Known gotchas
 
 - Bare `helm upgrade` / lone `--set` can wipe prior user values (lost `ssh.existingSecret`, reset ingress host) — always use `-f values-ncdlabs.yaml`
-- Pod may be pinned via `nodeSelector` — set explicitly in values if you need hostNetwork NDP on a specific node
+- Do not hostname-pin the STS; local-path PV affinity keeps inventory on the disk node. Optional `nodeSelector` only if you need hostNetwork NDP on a specific node
+- `hostNetwork: true` makes the Service endpoint the node LAN IP; if that port is firewalled from other nodes, Traefik returns 504/timeout while port-forward still works — keep `hostNetwork: false` unless NDP is required and the host port is opened
 - `latest` tag needs `rollout restart` after image import (StatefulSet: `kubectl rollout restart sts/cmdb-frontend -n cmdb`)
 - Helm SSA can conflict with prior `kubectl replace` on podAnnotations — prefer `rollout restart`
 - After agent/probe/API changes: sync `chart/cmdb-frontend/files/{loader,agent_api,main,probe,scan,addresses,security}.py` then `helm upgrade` + rollout
@@ -70,4 +80,4 @@
 
 - Public repo sample inventory under `inventory/` (demo-lab / example.com)
 - Mutating routes respect optional `CMDB_API_TOKEN` (`X-CMDB-Token` / Bearer)
-- Cluster Ingress host: `cmdb.ncdlabs.com`; SSH secret: `cmdb-ssh`
+- Cluster Ingress host: `cmdb.ncdlabs.com`; TLS via cert-manager ClusterIssuer `letsencrypt-cloudflare-production` (DNS-01); SSH secret: `cmdb-ssh`
