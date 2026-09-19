@@ -19,3 +19,5 @@ data:
 {{ .Files.Get "files/addresses.py" | indent 4 }}
   security.py: |
 {{ .Files.Get "files/security.py" | indent 4 }}
+  settings.py: |
+{{ .Files.Get "files/settings.py" | indent 4 }}

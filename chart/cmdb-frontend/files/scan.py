@@ -4,14 +4,22 @@ from __future__ import annotations
 
 import concurrent.futures
 import ipaddress
+import json
+import os
 import re
 import socket
 import ssl
 import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Iterable
 
 from cmdb_api.addresses import AddressExtractor
+
+# Persisted under CMDB_ROOT (PVC) — scan-to-scan baseline, not inventory YAML.
+LAST_NETWORK_SCAN_REL = Path(".cmdb") / "last-network-scan.json"
+_COMPARE_FIELDS = ("hostname", "ports", "mac", "ssh_open", "ping", "family")
+LAN_RESCAN_NOTE = "Added from LAN rescan. Confirm identity before promoting status."
 
 # Light fingerprint ports — same spirit as prior unidentified LAN notes.
 PROBE_PORTS = (22, 80, 443, 445, 8080, 8443)
@@ -23,6 +31,14 @@ IPV6_SWEEP_MAX_HOSTS = 256
 # Cap IPv4 sweeps too — a mis-set /8 or /0 must not hang the API.
 IPV4_SWEEP_MAX_HOSTS = 1024
 NEIGH_OK_STATES = {"REACHABLE", "STALE", "DELAY", "PROBE", "PERMANENT", "NOARP"}
+
+# Cluster / overlay ranges — never treat as the site LAN when deriving /24s.
+_CLUSTER_V4_PREFIXES = (
+    ipaddress.ip_network("10.42.0.0/16"),  # k3s pods
+    ipaddress.ip_network("10.43.0.0/16"),  # k3s services
+    ipaddress.ip_network("10.244.0.0/16"),  # flannel
+    ipaddress.ip_network("10.96.0.0/12"),  # common kube service CIDR
+)
 
 # Re-export AddressExtractor helpers so existing imports keep working.
 normalize_ip = AddressExtractor.normalize_ip
@@ -130,8 +146,90 @@ def collect_inventory_hostnames(items: Iterable[dict[str, Any]]) -> set[str]:
     return names
 
 
-def derive_subnets(items: Iterable[dict[str, Any]]) -> list[str]:
-    """IPv4 + IPv6 prefixes from env.network and server addresses."""
+def _is_cluster_overlay_v4(addr: ipaddress.IPv4Address) -> bool:
+    return any(addr in prefix for prefix in _CLUSTER_V4_PREFIXES)
+
+
+def private_lan_slash24(ip: str) -> str | None:
+    """Return ``a.b.c.0/24`` for a private site IP; skip loopback/link-local/cluster overlays."""
+    try:
+        addr = ipaddress.IPv4Address(ip.strip())
+    except ValueError:
+        return None
+    if not addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_multicast:
+        return None
+    if _is_cluster_overlay_v4(addr):
+        return None
+    return str(ipaddress.ip_network(f"{addr}/24", strict=False))
+
+
+def _parse_cidr_list(raw: str) -> list[str]:
+    out: list[str] = []
+    for part in raw.replace(";", ",").split(","):
+        cidr = part.strip()
+        if not cidr:
+            continue
+        try:
+            ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            continue
+        out.append(cidr)
+    return out
+
+
+def _local_iface_private_v4() -> list[str]:
+    """Private non-overlay IPv4s from ``ip -4 -o addr`` (useful with hostNetwork)."""
+    try:
+        proc = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show", "scope", "global"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    found: list[str] = []
+    for line in (proc.stdout or "").splitlines():
+        # ... inet 192.168.1.10/24 ...
+        match = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)(?:/\d+)?", line)
+        if not match:
+            continue
+        slash24 = private_lan_slash24(match.group(1))
+        if slash24:
+            found.append(slash24)
+    return found
+
+
+def collect_runtime_lan_cidrs(extra_cidrs: list[str] | None = None) -> list[str]:
+    """LAN prefixes from deploy env + optional PVC settings + node host IP + ifaces."""
+    found: set[str] = set()
+    for cidr in _parse_cidr_list(os.environ.get("CMDB_LAN_CIDR", "")):
+        found.add(str(ipaddress.ip_network(cidr, strict=False)))
+    for cidr in extra_cidrs or []:
+        try:
+            found.add(str(ipaddress.ip_network(str(cidr).strip(), strict=False)))
+        except ValueError:
+            continue
+    node_ip = (os.environ.get("CMDB_NODE_IP") or "").strip()
+    slash24 = private_lan_slash24(node_ip)
+    if slash24:
+        found.add(slash24)
+    found.update(_local_iface_private_v4())
+    return sorted(found)
+
+
+def derive_subnets(
+    items: Iterable[dict[str, Any]],
+    *,
+    extra_lan_cidrs: list[str] | None = None,
+) -> list[str]:
+    """IPv4 + IPv6 prefixes from runtime env, PVC settings, inventory, and server addresses.
+
+    Sources are **unioned** so a leftover sample ``lan_cidr`` (e.g. ``10.0.0.0/24``) cannot
+    hide the real site LAN when ``CMDB_NODE_IP`` / ``CMDB_LAN_CIDR`` / settings / host
+    interfaces provide a private non-overlay prefix.
+    """
     v4: set[str] = set()
     v6: set[str] = set()
 
@@ -148,6 +246,9 @@ def derive_subnets(items: Iterable[dict[str, Any]]) -> list[str]:
                 return
             v6.add(str(network_obj))
 
+    for cidr in collect_runtime_lan_cidrs(extra_lan_cidrs):
+        _add_network(cidr)
+
     for item in items:
         if str(item.get("kind") or "") != "environment":
             continue
@@ -163,52 +264,46 @@ def derive_subnets(items: Iterable[dict[str, Any]]) -> list[str]:
                     if isinstance(entry, str) and entry.strip():
                         _add_network(entry)
 
-    if not v4:
-        for item in items:
-            if str(item.get("kind") or "") != "server":
-                continue
-            addresses = item.get("addresses")
-            if not isinstance(addresses, dict):
-                continue
-            ip = ipv4_from_cidr_or_addr(addresses.get("ipv4"))
-            if not ip:
-                continue
-            try:
-                v4.add(str(ipaddress.ip_network(f"{ip}/24", strict=False)))
-            except ValueError:
-                continue
-
-    if not v6:
-        for item in items:
-            if str(item.get("kind") or "") != "server":
-                continue
-            addresses = item.get("addresses")
-            if isinstance(addresses, dict):
-                ip = ipv6_from_cidr_or_addr(addresses.get("ipv6"))
-                if ip:
-                    try:
-                        addr = ipaddress.IPv6Address(ip)
-                        if not addr.is_link_local:
-                            v6.add(str(ipaddress.ip_network(f"{ip}/64", strict=False)))
-                    except ValueError:
-                        pass
-            network = item.get("network")
-            if isinstance(network, dict):
-                interfaces = network.get("interfaces")
-                if isinstance(interfaces, list):
-                    for iface in interfaces:
-                        if not isinstance(iface, dict):
+    for item in items:
+        if str(item.get("kind") or "") != "server":
+            continue
+        addresses = item.get("addresses")
+        if isinstance(addresses, dict):
+            ip4 = ipv4_from_cidr_or_addr(addresses.get("ipv4"))
+            if ip4:
+                slash24 = private_lan_slash24(ip4)
+                if slash24:
+                    v4.add(slash24)
+            ip6 = ipv6_from_cidr_or_addr(addresses.get("ipv6"))
+            if ip6:
+                try:
+                    addr = ipaddress.IPv6Address(ip6)
+                    if not addr.is_link_local:
+                        v6.add(str(ipaddress.ip_network(f"{ip6}/64", strict=False)))
+                except ValueError:
+                    pass
+        network = item.get("network")
+        if isinstance(network, dict):
+            interfaces = network.get("interfaces")
+            if isinstance(interfaces, list):
+                for iface in interfaces:
+                    if not isinstance(iface, dict):
+                        continue
+                    for candidate in _iface_addrs(iface):
+                        if _is_ipv4(candidate):
+                            slash24 = private_lan_slash24(candidate)
+                            if slash24:
+                                v4.add(slash24)
                             continue
-                        for candidate in _iface_addrs(iface):
-                            if not _is_ipv6(candidate):
+                        if not _is_ipv6(candidate):
+                            continue
+                        try:
+                            addr = ipaddress.IPv6Address(candidate)
+                            if addr.is_link_local:
                                 continue
-                            try:
-                                addr = ipaddress.IPv6Address(candidate)
-                                if addr.is_link_local:
-                                    continue
-                                v6.add(str(ipaddress.ip_network(f"{candidate}/64", strict=False)))
-                            except ValueError:
-                                continue
+                            v6.add(str(ipaddress.ip_network(f"{candidate}/64", strict=False)))
+                        except ValueError:
+                            continue
 
     return sorted(v4 | v6)
 
@@ -486,11 +581,12 @@ def _probe_host(ip: str, *, source: str, hostname_hint: str | None = None) -> di
     }
 
 
-def read_ipv6_neighbors() -> list[dict[str, str]]:
-    """Parse `ip -6 neigh` (meaningful under hostNetwork)."""
+def read_neighbors(*, ipv6: bool) -> list[dict[str, str]]:
+    """Parse `ip -4|-6 neigh` (meaningful under hostNetwork)."""
+    flag = "-6" if ipv6 else "-4"
     try:
         completed = subprocess.run(
-            ["ip", "-6", "neigh", "show"],
+            ["ip", flag, "neigh", "show"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -506,7 +602,7 @@ def read_ipv6_neighbors() -> list[dict[str, str]]:
         parts = line.split()
         if len(parts) < 1:
             continue
-        ip = ipv6_from_cidr_or_addr(parts[0])
+        ip = ipv6_from_cidr_or_addr(parts[0]) if ipv6 else ipv4_from_cidr_or_addr(parts[0])
         if not ip:
             continue
         state = ""
@@ -524,6 +620,16 @@ def read_ipv6_neighbors() -> list[dict[str, str]]:
             state = "UNKNOWN"
         neighbors.append({"ip": ip, "lladdr": lladdr, "state": state})
     return neighbors
+
+
+def read_ipv6_neighbors() -> list[dict[str, str]]:
+    """Parse `ip -6 neigh` (meaningful under hostNetwork)."""
+    return read_neighbors(ipv6=True)
+
+
+def read_ipv4_neighbors() -> list[dict[str, str]]:
+    """Parse `ip -4 neigh` (ARP table; meaningful under hostNetwork)."""
+    return read_neighbors(ipv6=False)
 
 
 def _ip_in_prefixes(ip: str, prefixes: list[Any]) -> bool:
@@ -546,6 +652,269 @@ def _sort_discovered(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(rows, key=key)
 
 
+def observation_record(row: dict[str, Any]) -> dict[str, Any]:
+    """Stable fingerprint of a scan sighting for snapshot / diff."""
+    ports = row.get("ports") or []
+    if not isinstance(ports, list):
+        ports = []
+    return {
+        "ip": str(row.get("ip") or ""),
+        "family": row.get("family"),
+        "hostname": row.get("hostname") or None,
+        "ports": sorted(int(p) for p in ports if isinstance(p, int) or str(p).isdigit()),
+        "ssh_open": bool(row.get("ssh_open")),
+        "ping": bool(row.get("ping")),
+        "mac": row.get("mac") or None,
+        "source": row.get("source"),
+        "in_inventory": bool(row.get("in_inventory")),
+    }
+
+
+def _comparable(record: dict[str, Any]) -> dict[str, Any]:
+    return {field: record.get(field) for field in _COMPARE_FIELDS}
+
+
+def diff_observations(
+    previous: dict[str, Any] | None,
+    current_hosts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compare current observations to the last persisted scan snapshot."""
+    current_map = {
+        rec["ip"]: rec
+        for rec in (observation_record(h) for h in current_hosts)
+        if rec["ip"]
+    }
+    if not previous or not isinstance(previous.get("hosts"), list):
+        return {
+            "previous_scanned_at": None,
+            "baseline": False,
+            "added": [],
+            "removed": [],
+            "modified": [],
+            "counts": {"added": 0, "removed": 0, "modified": 0},
+            "note": "First scan — no previous baseline to compare.",
+        }
+
+    prev_map: dict[str, dict[str, Any]] = {}
+    for raw in previous["hosts"]:
+        if not isinstance(raw, dict):
+            continue
+        rec = observation_record(raw)
+        if rec["ip"]:
+            prev_map[rec["ip"]] = rec
+
+    added = _sort_discovered([current_map[ip] for ip in current_map.keys() - prev_map.keys()])
+    removed = _sort_discovered([prev_map[ip] for ip in prev_map.keys() - current_map.keys()])
+    modified: list[dict[str, Any]] = []
+    for ip in sorted(current_map.keys() & prev_map.keys(), key=lambda x: x):
+        before = _comparable(prev_map[ip])
+        after = _comparable(current_map[ip])
+        changes = [field for field in _COMPARE_FIELDS if before.get(field) != after.get(field)]
+        if changes:
+            modified.append(
+                {
+                    "ip": ip,
+                    "changes": changes,
+                    "before": before,
+                    "after": after,
+                    "hostname": current_map[ip].get("hostname"),
+                    "family": current_map[ip].get("family"),
+                }
+            )
+
+    return {
+        "previous_scanned_at": previous.get("scanned_at"),
+        "baseline": True,
+        "added": added,
+        "removed": removed,
+        "modified": modified,
+        "counts": {
+            "added": len(added),
+            "removed": len(removed),
+            "modified": len(modified),
+        },
+    }
+
+
+def load_last_network_scan(root: Path) -> dict[str, Any] | None:
+    path = root / LAST_NETWORK_SCAN_REL
+    try:
+        if not path.is_file():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def save_last_network_scan(
+    root: Path,
+    *,
+    scanned_at: str,
+    subnets: list[str],
+    hosts: list[dict[str, Any]],
+) -> str | None:
+    """Persist snapshot under CMDB_ROOT. Returns relative path or None if not writable."""
+    path = root / LAST_NETWORK_SCAN_REL
+    payload = {
+        "scanned_at": scanned_at,
+        "subnets": list(subnets),
+        "hosts": [observation_record(h) for h in hosts],
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+        tmp.replace(path)
+        return str(LAST_NETWORK_SCAN_REL)
+    except OSError:
+        return None
+
+
+def _keep_sighting(result: dict[str, Any]) -> bool:
+    return bool(
+        result.get("source") in {"ndp", "arp", "aaaa"}
+        or result.get("ports")
+        or result.get("ping")
+    )
+
+
+_MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$", re.I)
+_SOURCE_PRIORITY = {
+    "ndp": 4,
+    "arp": 4,
+    "aaaa": 3,
+    "ipv6-sweep": 2,
+    "ipv4-sweep": 1,
+}
+
+
+def normalize_mac(raw: Any) -> str | None:
+    """Normalize MAC to lowercase colon form, or None if invalid."""
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip().lower().replace("-", ":")
+    if "." in s and ":" not in s:
+        hexonly = re.sub(r"[^0-9a-f]", "", s)
+        if len(hexonly) == 12:
+            s = ":".join(hexonly[i : i + 2] for i in range(0, 12, 2))
+    if not _MAC_RE.match(s):
+        return None
+    return s
+
+
+def hostname_merge_key(hostname: Any) -> str | None:
+    if not isinstance(hostname, str):
+        return None
+    key = hostname.strip().lower().rstrip(".")
+    return key or None
+
+
+def merge_scan_add_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Coalesce complementary IPv4+IPv6 selections that share a hostname into one
+    device so Add writes a single dual-stack server CI.
+    """
+    if len(entries) < 2:
+        return list(entries)
+
+    def _family_of(entry: dict[str, Any]) -> str | None:
+        ipv4 = ipv4_from_cidr_or_addr(entry.get("ipv4") or entry.get("ip"))
+        ipv6 = ipv6_from_cidr_or_addr(entry.get("ipv6"))
+        if not ipv6:
+            raw_ip = str(entry.get("ip") or "")
+            if ":" in raw_ip:
+                ipv6 = ipv6_from_cidr_or_addr(raw_ip)
+        if ipv4 and not ipv6:
+            return "ipv4"
+        if ipv6 and not ipv4:
+            return "ipv6"
+        if ipv4 and ipv6:
+            return "both"
+        return None
+
+    def _ports_of(entry: dict[str, Any]) -> list[int]:
+        raw = entry.get("ports") or []
+        out: list[int] = []
+        for p in raw:
+            if isinstance(p, (int, float, str)) and str(p).isdigit():
+                n = int(p)
+                if 1 <= n <= 65535:
+                    out.append(n)
+        return out
+
+    def _merge_pair(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
+        a_v4 = ipv4_from_cidr_or_addr(a.get("ipv4") or (a.get("ip") if ":" not in str(a.get("ip") or "") else None))
+        a_v6 = ipv6_from_cidr_or_addr(a.get("ipv6") or (a.get("ip") if ":" in str(a.get("ip") or "") else None))
+        b_v4 = ipv4_from_cidr_or_addr(b.get("ipv4") or (b.get("ip") if ":" not in str(b.get("ip") or "") else None))
+        b_v6 = ipv6_from_cidr_or_addr(b.get("ipv6") or (b.get("ip") if ":" in str(b.get("ip") or "") else None))
+        ipv4 = a_v4 or b_v4
+        ipv6 = a_v6 or b_v6
+        primary = ipv4 or ipv6 or str(a.get("ip") or b.get("ip") or "")
+        ports = sorted(set(_ports_of(a) + _ports_of(b)))
+        mac = normalize_mac(a.get("mac")) or normalize_mac(b.get("mac"))
+        src_a = str(a.get("source") or "")
+        src_b = str(b.get("source") or "")
+        source = (
+            src_a
+            if _SOURCE_PRIORITY.get(src_a, 0) >= _SOURCE_PRIORITY.get(src_b, 0)
+            else src_b
+        ) or None
+        # Prefer draft fields from the IPv4 row when both provide id/name.
+        prefer, other = (a, b) if a_v4 else (b, a) if b_v4 else (a, b)
+        item_id = str(prefer.get("id") or other.get("id") or "").strip() or None
+        name = str(prefer.get("name") or other.get("name") or "").strip() or None
+        hostname_raw = str(prefer.get("hostname") or other.get("hostname") or "").strip()
+        hostname = hostname_raw or None
+        merged: dict[str, Any] = {
+            **prefer,
+            "ip": primary,
+            "ipv4": ipv4,
+            "ipv6": ipv6,
+            "ports": ports,
+            "mac": mac,
+            "source": source,
+            "hostname": hostname,
+        }
+        if item_id:
+            merged["id"] = item_id
+        if name:
+            merged["name"] = name
+        return merged
+
+    pending = list(entries)
+    out: list[dict[str, Any]] = []
+    used: set[int] = set()
+    for i, entry in enumerate(pending):
+        if i in used:
+            continue
+        key = hostname_merge_key(entry.get("hostname"))
+        fam = _family_of(entry)
+        if not key or fam not in {"ipv4", "ipv6"}:
+            out.append(entry)
+            used.add(i)
+            continue
+        partner_idx: int | None = None
+        want = "ipv6" if fam == "ipv4" else "ipv4"
+        for j in range(i + 1, len(pending)):
+            if j in used:
+                continue
+            other = pending[j]
+            if hostname_merge_key(other.get("hostname")) != key:
+                continue
+            if _family_of(other) == want:
+                partner_idx = j
+                break
+        if partner_idx is None:
+            out.append(entry)
+            used.add(i)
+            continue
+        out.append(_merge_pair(entry, pending[partner_idx]))
+        used.add(i)
+        used.add(partner_idx)
+    return out
+
+
 def scan_subnets(
     subnets: list[str],
     known_ips: set[str],
@@ -554,7 +923,7 @@ def scan_subnets(
 ) -> dict[str, Any]:
     """
     Discover LAN hosts:
-    - IPv4: sweep inventory-derived prefixes
+    - IPv4: sweep inventory-derived prefixes + ARP neighbor MACs (`ip -4 neigh`)
     - IPv6: NDP neighbor table + AAAA for hostnames (never sweep a /64)
     - Small IPv6 prefixes (≤ /120 by default) may be swept
     """
@@ -585,9 +954,7 @@ def scan_subnets(
             continue
         hosts = list(network.hosts()) if network.num_addresses > 2 else list(network)
         for host in hosts:
-            ip = str(host)
-            if ip not in known_norm:
-                targets.append((ip, "ipv4-sweep"))
+            targets.append((str(host), "ipv4-sweep"))
 
     for network in v6_nets:
         # hosts() excludes network/broadcast-style endpoints where applicable.
@@ -600,16 +967,12 @@ def scan_subnets(
             continue
         hosts = list(network.hosts()) if network.num_addresses > 2 else list(network)
         for host in hosts:
-            ip = str(host)
-            if ip not in known_norm:
-                targets.append((ip, "ipv6-sweep"))
+            targets.append((str(host), "ipv6-sweep"))
 
-    ndp_macs: dict[str, str] = {}
+    neigh_macs: dict[str, str] = {}
     ndp_prefix_hint: set[str] = set()
     for neigh in read_ipv6_neighbors():
         ip = neigh["ip"]
-        if ip in known_norm:
-            continue
         addr = ipaddress.IPv6Address(ip)
         # Link-local is noisy and not useful as inventory identity — skip.
         if addr.is_link_local or addr.is_multicast or addr.is_unspecified:
@@ -620,9 +983,25 @@ def scan_subnets(
             pass
         if v6_nets and not _ip_in_prefixes(ip, v6_nets):
             continue
-        if neigh.get("lladdr"):
-            ndp_macs[ip] = neigh["lladdr"]
+        mac = normalize_mac(neigh.get("lladdr"))
+        if mac:
+            neigh_macs[ip] = mac
         targets.append((ip, "ndp"))
+
+    for neigh in read_ipv4_neighbors():
+        ip = neigh["ip"]
+        try:
+            addr = ipaddress.IPv4Address(ip)
+        except ValueError:
+            continue
+        if addr.is_link_local or addr.is_multicast or addr.is_unspecified or addr.is_loopback:
+            continue
+        if v4_nets and not _ip_in_prefixes(ip, v4_nets):
+            continue
+        mac = normalize_mac(neigh.get("lladdr"))
+        if mac:
+            neigh_macs[ip] = mac
+        targets.append((ip, "arp"))
 
     # AAAA only kept inside inventory prefixes, else prefixes observed via NDP.
     aaaa_nets: list[Any] = list(v6_nets)
@@ -640,8 +1019,6 @@ def scan_subnets(
     for host in hostname_set:
         for cand in _hostname_candidates(host):
             for ip in _aaaa_lookup(cand):
-                if ip in known_norm:
-                    continue
                 # Without a LAN IPv6 prefix hint, skip AAAA (avoids public CDN answers).
                 if not aaaa_nets or not _ip_in_prefixes(ip, aaaa_nets):
                     continue
@@ -649,14 +1026,25 @@ def scan_subnets(
                 targets.append((ip, "aaaa"))
 
     # Deduplicate targets — prefer richer source labels later at merge.
-    source_priority = {"ndp": 3, "aaaa": 2, "ipv6-sweep": 1, "ipv4-sweep": 1}
     best_source: dict[str, str] = {}
     for ip, source in targets:
         prev = best_source.get(ip)
-        if prev is None or source_priority.get(source, 0) > source_priority.get(prev, 0):
+        if prev is None or _SOURCE_PRIORITY.get(source, 0) > _SOURCE_PRIORITY.get(prev, 0):
             best_source[ip] = source
 
-    discovered_map: dict[str, dict[str, Any]] = {}
+    observed_map: dict[str, dict[str, Any]] = {}
+
+    def _store_sighting(result: dict[str, Any]) -> None:
+        if not result or not _keep_sighting(result):
+            return
+        ip = result["ip"]
+        if ip in neigh_macs:
+            result["mac"] = neigh_macs[ip]
+        if not result.get("hostname"):
+            result["hostname"] = hostname_hints.get(ip)
+        result["in_inventory"] = ip in known_norm
+        observed_map[ip] = result
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {
             pool.submit(
@@ -668,30 +1056,18 @@ def scan_subnets(
             for ip, source in best_source.items()
         }
         for fut in concurrent.futures.as_completed(futures):
-            result = fut.result()
-            if not result:
-                continue
-            ip = result["ip"]
-            if ip in known_norm:
-                continue
-            # Always keep NDP/AAAA sightings even if ports/ping failed.
-            if result["source"] in {"ndp", "aaaa"} or result["ports"] or result["ping"]:
-                if ip in ndp_macs:
-                    result["mac"] = ndp_macs[ip]
-                if not result.get("hostname"):
-                    result["hostname"] = hostname_hints.get(ip)
-                discovered_map[ip] = result
+            _store_sighting(fut.result())
 
     # Second pass: AAAA for PTR names found on IPv4 responders.
     extra_aaaa: dict[str, str | None] = {}
-    for row in discovered_map.values():
+    for row in list(observed_map.values()):
         if row.get("family") != "ipv4":
             continue
         hostname = row.get("hostname")
         if not isinstance(hostname, str) or not hostname.strip():
             continue
         for ip in _aaaa_lookup(hostname):
-            if ip in known_norm or ip in discovered_map:
+            if ip in observed_map:
                 continue
             if v6_nets and not _ip_in_prefixes(ip, v6_nets):
                 continue
@@ -714,26 +1090,25 @@ def scan_subnets(
                 for ip, hint in extra_aaaa.items()
             }
             for fut in concurrent.futures.as_completed(futures):
-                result = fut.result()
-                if result and result["ip"] not in known_norm:
-                    if not result.get("hostname"):
-                        result["hostname"] = hostname_hints.get(result["ip"])
-                    discovered_map[result["ip"]] = result
+                _store_sighting(fut.result())
 
     # Final hostname enrichment pass (forward DNS map for IPs that lacked PTR).
-    for ip, row in discovered_map.items():
+    for ip, row in observed_map.items():
         if not row.get("hostname"):
             hint = hostname_hints.get(ip)
             if hint:
                 row["hostname"] = hint
 
-    discovered = _sort_discovered(list(discovered_map.values()))
+    observed = _sort_discovered(list(observed_map.values()))
+    discovered = _sort_discovered([row for row in observed if not row.get("in_inventory")])
     return {
         "ok": True,
         "scanned_at": scanned_at,
         "subnets": subnets,
         "targets": len(best_source),
         "known_skipped": len(known_norm),
+        "observed": observed,
+        "observed_count": len(observed),
         "discovered": discovered,
         "count": len(discovered),
         "ipv4_count": sum(1 for d in discovered if d.get("family") == "ipv4"),
@@ -796,6 +1171,8 @@ def build_server_document(
     ports: list[int] | None,
     ssh_user: str | None,
     notes: str | None,
+    mac: str | None = None,
+    source: str | None = None,
 ) -> dict[str, Any]:
     if not ipv4 and not ipv6:
         raise ValueError("ipv4 or ipv6 required")
@@ -804,6 +1181,13 @@ def build_server_document(
         addresses["ipv4"] = ipv4
     if ipv6:
         addresses["ipv6"] = ipv6
+    mac_n = normalize_mac(mac)
+    if mac_n:
+        addresses["mac"] = mac_n
+    sources = ["network-scan"]
+    src = str(source).strip() if isinstance(source, str) and source.strip() else None
+    if src and src not in sources:
+        sources.append(f"scan:{src}")
     doc: dict[str, Any] = {
         "id": item_id,
         "kind": "server",
@@ -811,9 +1195,8 @@ def build_server_document(
         "status": status,
         "updated": _utc_date(),
         "addresses": addresses,
-        "sources": ["network-scan"],
-        "notes": notes
-        or "Added from LAN rescan. Confirm identity before promoting status.",
+        "sources": sources,
+        "notes": notes or LAN_RESCAN_NOTE,
     }
     if env:
         doc["env"] = env

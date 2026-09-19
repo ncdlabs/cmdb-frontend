@@ -64,9 +64,8 @@ hardware:
 Legacy `hardware.storage` (mount rows) is deprecated — migrate to `filesystems`. UI still reads `storage` as a fallback.
 
 Live metrics (load, RAM used, temperature, uptime, fresh SMART/NIC gauges) are **not** auto-written into YAML.
-The browse UI loads them via `POST /api/items/{id}/live` when you open a probeable server and the client-side live
-cache is older than **5 minutes** (or missing), and when you click **Refresh** (always forces a new probe).
-Never poll on an interval.
+The browse UI loads them via `POST /api/items/{id}/live` only when you click **Refresh** (forces a new probe).
+Select hydrates from the **5-minute** client-side live cache when present; it never auto-probes. Never poll on an interval.
 
 Optional one-shot enrichment: `POST /api/items/{id}/live?persist=true` writes static **hardware / os / network** (plus `updated`) from a successful probe into the server YAML and reloads the store. It does **not** change `status`, and it never stores live gauges. Never poll this on an interval; not an agent/MCP tool.
 
@@ -74,10 +73,30 @@ Optional one-shot enrichment: `POST /api/items/{id}/live?persist=true` writes st
 
 Toolbar **Rescan network** runs `POST /api/network/scan`:
 
-- **IPv4:** sweep inventory-derived prefixes (`env.network.lan_cidr` or /24s from server IPv4s) with TCP fingerprint (+ ICMP when permitted).
+- **IPv4:** sweep the **union** of (1) `CMDB_LAN_CIDR` if set, (2) `/24` from `CMDB_NODE_IP` (pod `status.hostIP`, skipping k3s/CNI overlays), (3) private non-overlay addresses on host interfaces, (4) `env.network.lan_cidr`, (5) `/24`s from server IPv4s — with TCP fingerprint (+ ICMP when permitted).
 - **IPv6:** never sweep a /64. Discover via NDP (`ip -6 neigh`, pod uses `hostNetwork`) and AAAA lookups for inventory / PTR hostnames; optional sweep only if a prefix has ≤256 hosts (e.g. `/120`).
+- **MAC:** from IPv6 NDP and IPv4 ARP (`ip -4 neigh`) neighbor tables when available under hostNetwork.
 
-Unknown hosts can be multi-selected and written as new `servers/<id>.yaml` via `POST /api/network/devices` when `CMDB_ROOT` is writable (cluster: StatefulSet PVC). Store `addresses.ipv4` and/or `addresses.ipv6`. Optional env keys: `lan_cidr_v6`, `ula_cidr`. Do not expose scan/add on the agent/MCP API. Do not poll rescan on an interval.
+Unknown hosts are selected by default in the UI and written as new `servers/<id>.yaml` via `POST /api/network/devices` when the operator confirms Add and `CMDB_ROOT` is writable (cluster: StatefulSet PVC). Store `addresses.ipv4` and/or `addresses.ipv6`, plus `addresses.mac` when NDP/ARP reported one, and `sources` including `scan:<ndp|arp|aaaa|…>`. Complementary IPv4+IPv6 rows that share a hostname are merged into one CI. Optional env keys: `lan_cidr_v6`, `ula_cidr`. Live inventory stays on the PVC — do not commit real host YAML to git. Do not expose scan/add on the agent/MCP API. Do not poll rescan on an interval.
+
+New servers are created with `status: unknown` and a short confirmation note. Detail **Confirm identity** (`POST /api/items/{id}/confirm`) promotes them to `active` and clears that default note. Manual UI only. Optional ops settings may set `ssh:` from the default SSH user and run probe+persist on confirm.
+
+## Operational settings
+
+PVC file `.cmdb/settings.yaml` (UI `/settings`, API `GET/PUT /api/settings`) overrides empty Helm/env defaults for:
+
+- `default_ssh_user` — LAN Add + optional Confirm identity SSH fill
+- `lan_cidrs` — extra scan prefixes (unioned with `CMDB_LAN_CIDR` / node IP)
+- `default_env` — env applied when Add leaves env blank
+- `discover_select_all`, `confirm_sets_ssh`, `confirm_probes_persist`
+
+Do not put secrets in settings YAML. API token and SSH keys remain Helm/K8s-only.
+
+Each successful scan also:
+
+- Probes **all** responders on the swept prefixes (inventory members and unknowns) so presence/absence is comparable.
+- Compares against the previous snapshot at `.cmdb/last-network-scan.json` and returns `diff` with **added**, **removed**, and **modified** (hostname / ports / mac / ssh_open / ping / family).
+- Overwrites that snapshot when the inventory root is writable (first scan establishes the baseline).
 
 ## Network interfaces
 

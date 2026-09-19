@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
   ApiAuthError,
+  confirmServerIdentity,
   fetchAuthStatus,
   fetchItem,
   fetchItems,
@@ -73,6 +74,7 @@ export function BrowsePage() {
   const [tokenRequired, setTokenRequired] = useState(false)
   const [hasSessionToken, setHasSessionToken] = useState(() => Boolean(getStoredApiToken()))
   const [listVersion, setListVersion] = useState(0)
+  const [detailVersion, setDetailVersion] = useState(0)
 
   useEffect(() => {
     fetchMeta()
@@ -136,7 +138,7 @@ export function BrowsePage() {
     return () => {
       cancelled = true
     }
-  }, [itemId])
+  }, [itemId, detailVersion])
 
   const envs = useMemo(() => meta?.envs || [], [meta])
 
@@ -246,6 +248,9 @@ export function BrowsePage() {
             <button type="button" className="btn btn-secondary" onClick={() => setRescanOpen(true)}>
               Rescan network
             </button>
+            <Link className="btn btn-secondary" to="/settings">
+              Settings
+            </Link>
             {tokenRequired ? (
               <button type="button" className="btn btn-secondary" onClick={() => setTokenDialogOpen(true)}>
                 {hasSessionToken ? 'API token ✓' : 'Set API token'}
@@ -367,6 +372,11 @@ export function BrowsePage() {
                 item={detail}
                 onSelect={selectItem}
                 onAuthRequired={() => setTokenDialogOpen(true)}
+                onConfirmed={() => {
+                  setListVersion((v) => v + 1)
+                  setDetailVersion((v) => v + 1)
+                  fetchMeta().then(setMeta).catch(() => undefined)
+                }}
               />
             ) : null}
           </section>
@@ -506,60 +516,19 @@ function MachineSection({
     }
   }
 
+  // Hydrate from the 5 min client cache only — never auto-SSH on select (Refresh forces a probe).
   useEffect(() => {
-    let cancelled = false
-
     const cached = getCachedLiveProbe(item.id)
     if (cached) {
       setLive(cached.result)
       setProbeError(cached.result.ok ? null : cached.result.error || 'Probe failed')
-      setProbing(false)
-      probingRef.current = false
-      return () => {
-        cancelled = true
-      }
+    } else {
+      setLive(null)
+      setProbeError(null)
     }
-
-    setLive(null)
-    setProbeError(null)
     setProbing(false)
     probingRef.current = false
-    if (!canProbe) {
-      return () => {
-        cancelled = true
-      }
-    }
-
-    probingRef.current = true
-    setProbing(true)
-    fetchLiveProbe(item.id)
-      .then((result) => {
-        if (cancelled) return
-        setCachedLiveProbe(item.id, result)
-        setLive(result)
-        if (!result.ok) setProbeError(result.error || 'Probe failed')
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return
-        setLive(null)
-        clearCachedLiveProbe(item.id)
-        if (err instanceof ApiAuthError) {
-          setProbeError(err.message)
-          onAuthRequiredRef.current?.()
-        } else {
-          setProbeError(err instanceof Error ? err.message : String(err))
-        }
-      })
-      .finally(() => {
-        if (cancelled) return
-        probingRef.current = false
-        setProbing(false)
-      })
-
-    return () => {
-      cancelled = true
-    }
-  }, [item.id, canProbe])
+  }, [item.id])
 
   const showMachine =
     item.kind === 'server' ||
@@ -591,7 +560,7 @@ function MachineSection({
       <p className="machine-hint">
         Static specs come from inventory YAML (desired vs last observed).
         {canProbe
-          ? ' Selecting a server SSH-probes when live data is older than 5 minutes (or missing). Refresh forces a new probe. Never polled on an interval.'
+          ? ' Live metrics use a 5-minute in-browser cache after Refresh; select never auto-probes. Never polled on an interval.'
           : null}
       </p>
 
@@ -1018,11 +987,36 @@ function CiDetailView({
   item,
   onSelect,
   onAuthRequired,
+  onConfirmed,
 }: {
   item: CiDetail
   onSelect: (id: string) => void
   onAuthRequired?: () => void
+  onConfirmed?: () => void
 }) {
+  const [confirming, setConfirming] = useState(false)
+  const [confirmError, setConfirmError] = useState<string | null>(null)
+  const needsConfirm = item.kind === 'server' && item.status === 'unknown'
+
+  async function onConfirmIdentity() {
+    if (!needsConfirm || confirming) return
+    setConfirming(true)
+    setConfirmError(null)
+    try {
+      await confirmServerIdentity(item.id)
+      onConfirmed?.()
+    } catch (err) {
+      if (err instanceof ApiAuthError) {
+        setConfirmError(err.message)
+        onAuthRequired?.()
+      } else {
+        setConfirmError(err instanceof Error ? err.message : String(err))
+      }
+    } finally {
+      setConfirming(false)
+    }
+  }
+
   const reserved = new Set([
     'id',
     'name',
@@ -1084,6 +1078,26 @@ function CiDetailView({
           </div>
         </div>
       </header>
+
+      {needsConfirm ? (
+        <div className="alert alert-warn" role="status">
+          <p style={{ margin: '0 0 0.75rem' }}>
+            Unconfirmed server (usually from LAN rescan). Review addresses and hostname, then confirm
+            identity to set status to <span className="mono">active</span>.
+          </p>
+          {confirmError ? <div className="error-state">{confirmError}</div> : null}
+          <div className="action-row" style={{ marginBottom: 0 }}>
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={confirming}
+              onClick={() => void onConfirmIdentity()}
+            >
+              {confirming ? 'Confirming…' : 'Confirm identity'}
+            </button>
+          </div>
+        </div>
+      ) : null}
 
       <section className="detail-section" aria-label="Overview">
         <h4 className="detail-section-title">Overview</h4>

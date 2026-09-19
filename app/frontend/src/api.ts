@@ -254,6 +254,23 @@ export function fetchLiveProbe(id: string): Promise<LiveProbe> {
   return getJson<LiveProbe>(`/api/items/${encodeURIComponent(id)}/live`, { method: 'POST' })
 }
 
+export type ConfirmIdentityResult = {
+  ok: boolean
+  id: string
+  path: string
+  status: string
+  updated?: string
+  notes?: string | null
+  item: CiDetail
+}
+
+/** Promote status unknown → active after LAN rescan. Manual UI only. */
+export function confirmServerIdentity(id: string): Promise<ConfirmIdentityResult> {
+  return getJson<ConfirmIdentityResult>(`/api/items/${encodeURIComponent(id)}/confirm`, {
+    method: 'POST',
+  })
+}
+
 export type DiscoveredHost = {
   ip: string
   family?: 'ipv4' | 'ipv6' | string
@@ -264,6 +281,38 @@ export type DiscoveredHost = {
   source?: string
   mac?: string
   in_unidentified?: boolean
+  in_inventory?: boolean
+}
+
+export type ScanDiffHost = {
+  ip: string
+  family?: string | null
+  hostname?: string | null
+  ports?: number[]
+  ssh_open?: boolean
+  ping?: boolean
+  mac?: string | null
+  source?: string | null
+  in_inventory?: boolean
+}
+
+export type ScanDiffModified = {
+  ip: string
+  changes: string[]
+  before: Record<string, unknown>
+  after: Record<string, unknown>
+  hostname?: string | null
+  family?: string | null
+}
+
+export type NetworkScanDiff = {
+  previous_scanned_at: string | null
+  baseline: boolean
+  added: ScanDiffHost[]
+  removed: ScanDiffHost[]
+  modified: ScanDiffModified[]
+  counts: { added: number; removed: number; modified: number }
+  note?: string
 }
 
 export type NetworkScanResult = {
@@ -274,11 +323,67 @@ export type NetworkScanResult = {
   known_skipped: number
   discovered: DiscoveredHost[]
   count: number
+  observed_count?: number
   ipv4_count?: number
   ipv6_count?: number
   notes?: string[]
   writable: boolean
   root: string
+  diff?: NetworkScanDiff
+  snapshot_saved?: boolean
+  snapshot_path?: string | null
+  discover_select_all?: boolean
+  default_env?: string
+}
+
+export type OpsSettingsFields = {
+  default_ssh_user: string
+  lan_cidrs: string[]
+  default_env: string
+  discover_select_all: boolean
+  confirm_sets_ssh: boolean
+  confirm_probes_persist: boolean
+  updated?: string | null
+}
+
+export type OpsSettingsResponse = {
+  ok: boolean
+  writable: boolean
+  settings_path: string
+  effective: OpsSettingsFields
+  stored: OpsSettingsFields
+  sources: Record<string, string>
+  deployment: {
+    cmdb_root?: string | null
+    cmdb_node_ip?: string | null
+    cmdb_lan_cidr_env?: string | null
+    cmdb_default_ssh_user_env?: string | null
+    cmdb_ssh_dir_configured?: boolean
+    cmdb_ssh_identity_configured?: boolean
+    api_token_required?: boolean
+  }
+  envs: string[]
+}
+
+export type OpsSettingsUpdate = {
+  default_ssh_user?: string
+  lan_cidrs?: string[] | string
+  default_env?: string
+  discover_select_all?: boolean
+  confirm_sets_ssh?: boolean
+  confirm_probes_persist?: boolean
+}
+
+export function fetchSettings(): Promise<OpsSettingsResponse> {
+  return getJson<OpsSettingsResponse>('/api/settings')
+}
+
+export function saveSettings(body: OpsSettingsUpdate): Promise<OpsSettingsResponse> {
+  return getJson<OpsSettingsResponse>('/api/settings', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
 }
 
 export type NetworkDeviceAdd = {
@@ -293,6 +398,8 @@ export type NetworkDeviceAdd = {
   ports?: number[]
   ssh_user?: string | null
   notes?: string | null
+  mac?: string | null
+  source?: string | null
 }
 
 export type NetworkAddResult = {

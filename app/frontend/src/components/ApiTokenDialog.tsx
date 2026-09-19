@@ -76,7 +76,7 @@ export function ApiTokenDialog({ open, tokenRequired, onClose, onSaved }: Props)
         <form onSubmit={onSubmit}>
           <p className="machine-hint">
             {tokenRequired
-              ? 'This deployment requires a shared secret for live probe, LAN rescan, and add-device. Stored in sessionStorage only for this browser tab.'
+              ? 'This deployment requires a shared secret for live probe, confirm identity, LAN rescan, and add-device. Stored in sessionStorage only for this browser tab.'
               : 'Optional. When the server sets CMDB_API_TOKEN, paste it here for mutating actions. Stored in sessionStorage only.'}
           </p>
           <div className="form-field">

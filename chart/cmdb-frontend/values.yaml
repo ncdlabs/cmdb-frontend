@@ -75,6 +75,9 @@ env:
   CMDB_STATIC: /app/static
   # Optional default SSH user when adding hosts with port 22 open (empty = omit ssh:)
   CMDB_DEFAULT_SSH_USER: ""
+  # Optional comma-separated LAN CIDRs for rescan (in addition to CMDB_NODE_IP /24).
+  # Example: "192.168.1.0/24". Leave empty to rely on node hostIP + inventory.
+  # CMDB_LAN_CIDR: ""
 
 # Shared secret for POST /api/items/*/live, /api/network/scan, /api/network/devices.
 # Leave empty for open local/dev; set via existingSecret in production.

@@ -12,15 +12,22 @@ alwaysApply: false
 - Prefer existing tokens and patterns; do not invent parallel visuals.
 - Action rows: destructive left; Cancel left of Confirm; Confirm rightmost. Cancel returns to the previous screen.
 - Forms (when present): frontend validation with field-level errors; Save disabled until dirty vs baseline and while pending.
-- Browse UI is mostly read-only. Exception: toolbar **Rescan network** may create new server YAML when inventory is writable — do not add broader edit/create CI flows without explicit approval.
+- Browse UI is mostly read-only. Exceptions: toolbar **Rescan network** may create new server YAML; detail
+  **Confirm identity** promotes `status: unknown` → `active` after LAN add; **/settings** edits PVC
+  operational settings (SSH default, LAN CIDRs, confirm/probe flags) — do not add broader CI editors
+  without explicit approval.
 - Results list: Active / Deprecated tabs (`result-tabs`); Active = non-deprecated; no status dropdown.
   Probeable servers show **Online** / **Offline** / **Unknown** reachability pills from the client live-probe cache (5 min TTL).
 - Applications: Placement section (servers + optional k3s namespace/workloads); do not invent live pod names in inventory.
-- Machine live metrics: auto SSH-probe on server select when client TTL (5 min) elapsed or cache miss;
-  **Refresh** forces a new probe. Never continuous interval polling of `POST /api/items/{id}/live`.
+- Machine live metrics: select hydrates from the client live-probe cache (5 min TTL) only — never auto-SSH on
+  select; **Refresh** runs a one-shot probe. Never continuous interval polling of `POST /api/items/{id}/live`.
   Optional `?persist=true` may write static hardware/os/network into inventory YAML (not live gauges; not via UI).
-  Reachability pills update from that same cache (not inventory `status`).
+  Reachability pills update from that same cache (not inventory `status`); Unknown until Refresh (or cache hit).
 - Network discovery: Rescan button only — never continuous polling of `POST /api/network/scan`.
+  Scan unions node LAN (`CMDB_NODE_IP` / optional `CMDB_LAN_CIDR`) with inventory prefixes; probes all
+  responders (inventory + unknown); returns added/removed/modified vs PVC `.cmdb/last-network-scan.json`;
+  unknown hosts default selected; Add writes PVC YAML with ipv4/ipv6, mac (NDP/ARP), `scan:<source>`,
+  and merges hostname-matched v4+v6 into one CI.
 - When `CMDB_API_TOKEN` is set, toolbar **Set API token** (sessionStorage + `X-CMDB-Token`) gates Refresh / Rescan / Add; follow existing dialog + Save-until-dirty patterns.
 - Detail panel: labeled rows + pills; copy buttons for pasteable values; never raw JSON dumps.
 - Ask before removing style-guide sections or documented patterns.

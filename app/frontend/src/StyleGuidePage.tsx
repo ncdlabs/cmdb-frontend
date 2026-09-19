@@ -61,6 +61,7 @@ export function StyleGuidePage() {
           <a href="#sg-detail">Detail</a>
           <a href="#sg-machine">Machine</a>
           <a href="#sg-network-rescan">Network rescan</a>
+          <a href="#sg-settings">Settings</a>
           <a href="#sg-tables">Tables</a>
           <a href="#sg-empty-loading">Empty / loading</a>
           <a href="#sg-a11y">Accessibility</a>
@@ -184,8 +185,21 @@ export function StyleGuidePage() {
           <p style={{ marginTop: '0.75rem' }}>
             <strong>Online</strong> / <strong>Offline</strong> / <strong>Unknown</strong> are SSH reachability pills for
             probeable servers. They come from the last live probe in this browser session (5-minute TTL). Unknown means not
-            probed yet (or cache expired). Not the same as inventory <code>status</code> (active / deprecated).
+            probed yet (or cache expired). Not the same as inventory <code>status</code> (active / deprecated / unknown).
+            Servers added by LAN rescan start as inventory <code>status: unknown</code>; detail shows{' '}
+            <strong>Confirm identity</strong> to promote to <code>active</code>.
           </p>
+          <div className="alert alert-warn" role="status" style={{ marginTop: '1rem' }}>
+            <p style={{ margin: '0 0 0.75rem' }}>
+              Unconfirmed server (usually from LAN rescan). Review addresses and hostname, then confirm identity to set
+              status to <span className="mono">active</span>.
+            </p>
+            <div className="action-row" style={{ marginBottom: 0 }}>
+              <button type="button" className="btn btn-primary">
+                Confirm identity
+              </button>
+            </div>
+          </div>
         </section>
 
         <section className="sg-section" id="sg-tabs" data-testid="sg-tabs">
@@ -282,9 +296,9 @@ export function StyleGuidePage() {
             <code>hardware.disks</code> (separate from <code>filesystems</code>), negotiated NIC speed under{' '}
             <code>network.interfaces</code>, plus static <code>os</code>/<code>hardware</code> from YAML. Optional{' '}
             <strong>Refresh</strong> runs a one-shot SSH probe (load, RAM, temp, physical disks, NICs, filesystem usage).
-            Opening a probeable server auto-probes when the client-side live cache is older than 5 minutes (or missing).
-            Never poll live metrics on an interval. Live results stay ephemeral in the UI. Optional API
-            persist (<code>?persist=true</code>) may write static hardware/os/network only.
+            Select hydrates from the 5-minute client live cache only — never auto-probes. Never poll live metrics
+            on an interval. Live results stay ephemeral in the UI. Optional API persist (<code>?persist=true</code>)
+            may write static hardware/os/network only.
           </p>
           <div className="demo-row" style={{ marginTop: '1rem' }}>
             <span className="mono">eth0 · 1000 Mb/s · full · 10.0.0.20/24</span>
@@ -314,7 +328,7 @@ export function StyleGuidePage() {
               </button>
             </div>
             <p className="machine-hint">
-              Static specs come from inventory YAML (desired vs last observed). Select auto-probes when live cache is older than 5 minutes; Refresh forces a new probe.
+              Static specs come from inventory YAML (desired vs last observed). Select uses the 5-minute live cache only; Refresh forces a new probe.
             </p>
             <div className="kv">
               <div className="kv-row">
@@ -345,17 +359,26 @@ export function StyleGuidePage() {
           <h2>Network rescan</h2>
           <p>
             Toolbar <strong>Rescan network</strong> opens a dialog and runs a one-shot LAN discovery (
-            <code>POST /api/network/scan</code>): IPv4 sweeps of inventory subnets (
-            <code>env.network.lan_cidr</code> or /24s from server IPv4s), plus IPv6 via NDP neighbors (
+            <code>POST /api/network/scan</code>): IPv4 sweeps of the union of node LAN (
+            <code>CMDB_NODE_IP</code> / optional <code>CMDB_LAN_CIDR</code>), inventory{' '}
+            <code>env.network.lan_cidr</code>, and server /24s, plus MAC from ARP (
+            <code>ip -4 neigh</code>) and IPv6 via NDP neighbors (
             <code>ip -6 neigh</code>, requires <code>hostNetwork</code>) and AAAA lookups — never brute-force a
-            /64. Results show family (ipv4/ipv6), IP, PTR, source, ports/MAC. Multi-select rows expose editable
-            Id/Name fields. <strong>Add selected</strong> writes <code>servers/&lt;id&gt;.yaml</code> with{' '}
-            <code>addresses.ipv4</code> and/or <code>addresses.ipv6</code>. Cancel closes the dialog. Action row:
-            Cancel left, Confirm rightmost.
+            /64. Each scan returns a <strong>Changes since last scan</strong> report (added / removed /
+            modified vs <code>.cmdb/last-network-scan.json</code> on the PVC). Unknown hosts are selected by
+            default. Results show family (ipv4/ipv6), IP, PTR, source, ports/MAC. Rows expose editable Id/Name
+            fields. <strong>Add selected</strong> writes <code>servers/&lt;id&gt;.yaml</code> with{' '}
+            <code>addresses.ipv4</code> and/or <code>addresses.ipv6</code>, <code>addresses.mac</code> when
+            NDP/ARP reported one, and <code>sources</code> including <code>scan:&lt;source&gt;</code>. Matching
+            hostname v4+v6 rows merge into one CI. Cancel closes the dialog. Action row: Cancel left, Confirm
+            rightmost.
           </p>
           <div className="demo-row" style={{ marginTop: '1rem' }}>
             <button type="button" className="btn btn-secondary">
               Rescan network
+            </button>
+            <button type="button" className="btn btn-secondary">
+              Settings
             </button>
             <button type="button" className="btn btn-secondary">
               Set API token
@@ -363,8 +386,9 @@ export function StyleGuidePage() {
           </div>
           <p style={{ marginTop: '0.75rem' }}>
             When the server sets <code>CMDB_API_TOKEN</code>, the toolbar shows <strong>Set API token</strong>.
-            Token is saved in sessionStorage and sent as <code>X-CMDB-Token</code> on Refresh / Rescan / Add.
-            Save is disabled until dirty vs the loaded baseline; Cancel closes the dialog.
+            Token is saved in sessionStorage and sent as <code>X-CMDB-Token</code> on Refresh / Rescan / Add /
+            Confirm / Settings save. Save is disabled until dirty vs the loaded baseline; Cancel closes the dialog
+            or returns to browse from Settings.
           </p>
           <div className="discover-row is-selected" style={{ marginTop: '1rem' }}>
             <div className="discover-check">
@@ -398,6 +422,29 @@ export function StyleGuidePage() {
             </button>
             <button type="button" className="btn btn-primary">
               Add selected (1)
+            </button>
+          </div>
+        </section>
+
+        <section className="sg-section" id="sg-settings" data-testid="sg-settings">
+          <h2>Settings</h2>
+          <p>
+            Route <code>/settings</code> edits PVC operational settings (
+            <code>.cmdb/settings.yaml</code>): default SSH user, extra LAN CIDRs, default env for Add, discover
+            select-all, and Confirm identity options (set <code>ssh:</code>, optional probe+persist). Deployment
+            facts (node IP, Helm env, SSH mount, token required) are read-only. Save disabled until dirty; Cancel
+            returns to browse.
+          </p>
+          <div className="form-field" style={{ maxWidth: '24rem', marginTop: '1rem' }}>
+            <label htmlFor="sg-settings-ssh">Default SSH user</label>
+            <input id="sg-settings-ssh" className="search-input" defaultValue="lou" readOnly />
+          </div>
+          <div className="action-row">
+            <button type="button" className="btn btn-secondary">
+              Cancel
+            </button>
+            <button type="button" className="btn btn-primary" disabled>
+              Save changes
             </button>
           </div>
         </section>

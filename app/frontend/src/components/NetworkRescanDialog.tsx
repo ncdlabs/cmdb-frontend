@@ -5,7 +5,11 @@ import {
   fetchNetworkScan,
   suggestServerId,
   type DiscoveredHost,
+  type NetworkDeviceAdd,
+  type NetworkScanDiff,
   type NetworkScanResult,
+  type ScanDiffHost,
+  type ScanDiffModified,
 } from '../api'
 
 const ID_RE = /^srv-[a-z0-9]+(?:-[a-z0-9]+)*$/
@@ -37,6 +41,166 @@ function validateName(name: string): string | null {
   return null
 }
 
+function hostLabel(host: { ip: string; hostname?: string | null }) {
+  const short = host.hostname?.split('.')[0]
+  return short || host.ip
+}
+
+function hostnameKey(hostname?: string | null): string | null {
+  if (!hostname?.trim()) return null
+  return hostname.trim().toLowerCase().replace(/\.$/, '')
+}
+
+function hostFamily(host: DiscoveredHost): 'ipv4' | 'ipv6' {
+  if (host.family === 'ipv6' || host.family === 'ipv4') return host.family
+  return host.ip.includes(':') ? 'ipv6' : 'ipv4'
+}
+
+const SOURCE_PRIORITY: Record<string, number> = {
+  ndp: 4,
+  arp: 4,
+  aaaa: 3,
+  'ipv6-sweep': 2,
+  'ipv4-sweep': 1,
+}
+
+/** Merge selected v4+v6 rows that share a hostname into one Add payload. */
+function buildAddDevices(
+  selectedHosts: DiscoveredHost[],
+  drafts: Record<string, Draft>,
+  env: string,
+): NetworkDeviceAdd[] {
+  const used = new Set<string>()
+  const devices: NetworkDeviceAdd[] = []
+
+  for (const host of selectedHosts) {
+    if (used.has(host.ip)) continue
+    const key = hostnameKey(host.hostname)
+    const fam = hostFamily(host)
+    const partner =
+      key != null
+        ? selectedHosts.find(
+            (other) =>
+              other.ip !== host.ip &&
+              !used.has(other.ip) &&
+              hostnameKey(other.hostname) === key &&
+              hostFamily(other) !== fam,
+          )
+        : undefined
+
+    const group = partner ? [host, partner] : [host]
+    for (const g of group) used.add(g.ip)
+
+    const v4 = group.find((h) => hostFamily(h) === 'ipv4')
+    const v6 = group.find((h) => hostFamily(h) === 'ipv6')
+    const prefer = v4 || host
+    const draft = drafts[prefer.ip] || drafts[host.ip]
+    const ports = [...new Set(group.flatMap((h) => h.ports || []))].sort((a, b) => a - b)
+    const mac = group.map((h) => h.mac).find((m) => Boolean(m)) || null
+    const source = group
+      .map((h) => h.source)
+      .filter((s): s is string => Boolean(s))
+      .sort((a, b) => (SOURCE_PRIORITY[b] || 0) - (SOURCE_PRIORITY[a] || 0))[0] || null
+    const ipv4 = v4?.ip || null
+    const ipv6 = v6?.ip || null
+    const primary = ipv4 || ipv6 || host.ip
+
+    devices.push({
+      ip: primary,
+      ipv4,
+      ipv6,
+      id: draft.id.trim(),
+      name: draft.name.trim(),
+      hostname: prefer.hostname || host.hostname || partner?.hostname || null,
+      env: env || null,
+      status: 'unknown',
+      ports,
+      ssh_user: null,
+      mac,
+      source,
+    })
+  }
+  return devices
+}
+
+function DiffSection({ diff }: { diff: NetworkScanDiff }) {
+  const { counts } = diff
+  const total = counts.added + counts.removed + counts.modified
+
+  if (!diff.baseline) {
+    return (
+      <div className="scan-diff" role="status">
+        <h3 className="scan-diff-title">Changes since last scan</h3>
+        <p className="muted-line">{diff.note || 'First scan — no previous baseline to compare.'}</p>
+      </div>
+    )
+  }
+
+  return (
+    <div className="scan-diff" role="region" aria-label="Changes since last scan">
+      <h3 className="scan-diff-title">Changes since last scan</h3>
+      <p className="mono muted-line">
+        vs {diff.previous_scanned_at || 'previous'} · {counts.added} added · {counts.removed} removed ·{' '}
+        {counts.modified} modified
+      </p>
+      {total === 0 ? <p className="muted-line">No changes since the previous scan.</p> : null}
+      {counts.added > 0 ? (
+        <DiffGroup title="Added" tone="added" hosts={diff.added} />
+      ) : null}
+      {counts.removed > 0 ? (
+        <DiffGroup title="Removed" tone="removed" hosts={diff.removed} />
+      ) : null}
+      {counts.modified > 0 ? <DiffModifiedList rows={diff.modified} /> : null}
+    </div>
+  )
+}
+
+function DiffGroup({
+  title,
+  tone,
+  hosts,
+}: {
+  title: string
+  tone: 'added' | 'removed'
+  hosts: ScanDiffHost[]
+}) {
+  return (
+    <div className={`scan-diff-group scan-diff-${tone}`}>
+      <h4>
+        {title} ({hosts.length})
+      </h4>
+      <ul className="scan-diff-list">
+        {hosts.map((host) => (
+          <li key={host.ip}>
+            <span className="discover-hostname">{hostLabel(host)}</span>
+            <span className="mono">{host.ip}</span>
+            {host.hostname && host.hostname.includes('.') ? (
+              <span className="muted-line">{host.hostname}</span>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
+function DiffModifiedList({ rows }: { rows: ScanDiffModified[] }) {
+  return (
+    <div className="scan-diff-group scan-diff-modified">
+      <h4>Modified ({rows.length})</h4>
+      <ul className="scan-diff-list">
+        {rows.map((row) => (
+          <li key={row.ip}>
+            <span className="discover-hostname">{hostLabel(row)}</span>
+            <span className="mono">{row.ip}</span>
+            <span className="muted-line">{row.changes.join(', ')}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
 export function NetworkRescanDialog({ open, envs, onClose, onAdded, onAuthRequired }: Props) {
   const [scanning, setScanning] = useState(false)
   const [adding, setAdding] = useState(false)
@@ -47,7 +211,6 @@ export function NetworkRescanDialog({ open, envs, onClose, onAdded, onAuthRequir
   const [env, setEnv] = useState('')
 
   const defaultEnv = useMemo(() => {
-    if (envs.includes('demo-lab')) return 'demo-lab'
     return envs[0] || ''
   }, [envs])
 
@@ -69,12 +232,16 @@ export function NetworkRescanDialog({ open, envs, onClose, onAdded, onAuthRequir
     try {
       const data = await fetchNetworkScan()
       setResult(data)
+      if (data.default_env) {
+        setEnv(data.default_env)
+      }
+      const selectAll = data.discover_select_all !== false
       const next: Record<string, Draft> = {}
       for (const host of data.discovered) {
         const id = suggestServerId(host.ip, host.hostname)
         const name = host.hostname?.split('.')[0] || host.ip
         next[host.ip] = {
-          selected: false,
+          selected: selectAll,
           id,
           name,
           idError: validateId(id),
@@ -108,13 +275,29 @@ export function NetworkRescanDialog({ open, envs, onClose, onAdded, onAuthRequir
     })
 
   const idDupes = useMemo(() => {
-    const counts = new Map<string, number>()
+    const counts = new Map<string, DiscoveredHost[]>()
     for (const h of selectedHosts) {
       const id = drafts[h.ip]?.id.trim()
       if (!id) continue
-      counts.set(id, (counts.get(id) || 0) + 1)
+      const list = counts.get(id) || []
+      list.push(h)
+      counts.set(id, list)
     }
-    return new Set([...counts.entries()].filter(([, n]) => n > 1).map(([id]) => id))
+    const dupes = new Set<string>()
+    for (const [id, hosts] of counts.entries()) {
+      if (hosts.length < 2) continue
+      // Same id on complementary v4+v6 with matching hostname is a merge, not a conflict.
+      if (
+        hosts.length === 2 &&
+        hostnameKey(hosts[0].hostname) &&
+        hostnameKey(hosts[0].hostname) === hostnameKey(hosts[1].hostname) &&
+        hostFamily(hosts[0]) !== hostFamily(hosts[1])
+      ) {
+        continue
+      }
+      dupes.add(id)
+    }
+    return dupes
   }, [selectedHosts, drafts])
 
   const canAdd = selectedValid && idDupes.size === 0 && !adding && Boolean(result?.writable)
@@ -145,23 +328,7 @@ export function NetworkRescanDialog({ open, envs, onClose, onAdded, onAuthRequir
     setAdding(true)
     setAddError(null)
     try {
-      const devices = selectedHosts.map((h) => {
-        const d = drafts[h.ip]
-        const family = h.family || (h.ip.includes(':') ? 'ipv6' : 'ipv4')
-        return {
-          ip: h.ip,
-          ipv4: family === 'ipv4' ? h.ip : null,
-          ipv6: family === 'ipv6' ? h.ip : null,
-          id: d.id.trim(),
-          name: d.name.trim(),
-          hostname: h.hostname,
-          env: env || null,
-          status: 'unknown',
-          ports: h.ports,
-          // Leave ssh_user unset — server applies CMDB_DEFAULT_SSH_USER when port 22 is open.
-          ssh_user: null,
-        }
-      })
+      const devices = buildAddDevices(selectedHosts, drafts, env)
       const addResult = await addNetworkDevices(devices)
       if (addResult.error_count > 0 && addResult.created_count === 0) {
         setAddError(addResult.errors.map((e) => e.error).join('; '))
@@ -205,8 +372,10 @@ export function NetworkRescanDialog({ open, envs, onClose, onAdded, onAuthRequir
           </button>
         </div>
         <p className="machine-hint">
-          One-shot LAN discovery: IPv4 subnet sweep plus IPv6 via NDP neighbors and AAAA lookups (no /64
-          brute-force). Select unknown hosts to add as server YAML. Never polled automatically.
+          One-shot LAN discovery: IPv4 subnet sweep (node LAN + inventory prefixes) plus IPv6 via NDP
+          neighbors and AAAA lookups (no /64 brute-force). Each scan reports added / removed / modified
+          vs the previous snapshot. Unknown hosts are selected by default — review, then Add. Never
+          polled automatically.
         </p>
 
         <div className="toolbar-row" style={{ marginBottom: '0.75rem' }}>
@@ -215,11 +384,12 @@ export function NetworkRescanDialog({ open, envs, onClose, onAdded, onAuthRequir
           </button>
           {result ? (
             <span className="mono muted-line">
-              {result.subnets.join(', ') || 'no prefixes'} · {result.count} new
+              {result.subnets.join(', ') || 'no prefixes'} · {result.observed_count ?? '—'} observed ·{' '}
+              {result.count} new
               {result.ipv4_count != null || result.ipv6_count != null
                 ? ` (v4 ${result.ipv4_count ?? 0} / v6 ${result.ipv6_count ?? 0})`
                 : ''}{' '}
-              · {result.known_skipped} known skipped
+              · {result.known_skipped} in inventory
             </span>
           ) : null}
         </div>
@@ -232,6 +402,8 @@ export function NetworkRescanDialog({ open, envs, onClose, onAdded, onAuthRequir
 
         {scanError ? <div className="error-state">{scanError}</div> : null}
         {scanning && !result ? <div className="loading-state">Scanning LAN…</div> : null}
+
+        {result && !scanning && result.diff ? <DiffSection diff={result.diff} /> : null}
 
         {result && !scanning && result.count === 0 ? (
           <div className="empty-state">No unknown responders found on scanned subnets.</div>

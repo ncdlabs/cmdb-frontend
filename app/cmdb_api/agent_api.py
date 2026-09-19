@@ -35,8 +35,9 @@ def build_agent_router(store: CmdbStore) -> APIRouter:
             "docs": "/docs",
             "notes": [
                 "Inventory contains no secrets.",
-                "Live SSH probe and LAN scan/add are not part of the agent API.",
+                "Live SSH probe, LAN scan/add, confirm identity, and settings are not part of the agent API.",
                 "When CMDB_API_TOKEN is set, those mutating UI routes require X-CMDB-Token.",
+                "Operational settings are PVC-backed (.cmdb/settings.yaml), not MCP-exposed.",
             ],
             "endpoints": {
                 "GET /api/agent": "This discovery document",

@@ -80,6 +80,11 @@ spec:
             - name: {{ $key }}
               value: {{ $value | quote }}
             {{- end }}
+            # Node LAN IP → /24 for rescan when inventory still has sample lan_cidr.
+            - name: CMDB_NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
             {{- if .Values.ssh.existingSecret }}
             - name: CMDB_SSH_DIR
               value: {{ .Values.ssh.mountPath | quote }}
@@ -126,6 +131,10 @@ spec:
             - name: probe
               mountPath: /app/cmdb_api/security.py
               subPath: security.py
+              readOnly: true
+            - name: probe
+              mountPath: /app/cmdb_api/settings.py
+              subPath: settings.py
               readOnly: true
             {{- if .Values.persistence.enabled }}
             - name: inventory-data

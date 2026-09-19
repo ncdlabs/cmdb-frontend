@@ -15,8 +15,18 @@ from pydantic import BaseModel, Field
 from cmdb_api.agent_api import build_agent_router
 from cmdb_api.loader import CmdbStore, default_cmdb_root
 from cmdb_api.probe import probe_host
-from cmdb_api.scan import scan_subnets
+from cmdb_api.scan import (
+    diff_observations,
+    load_last_network_scan,
+    save_last_network_scan,
+    scan_subnets,
+)
 from cmdb_api.security import StaticPathResolver, active_guard, require_api_token
+from cmdb_api.settings import (
+    deployment_facts,
+    effective_settings,
+    save_settings,
+)
 
 STORE = CmdbStore(root=default_cmdb_root())
 _SCAN_LOCK = threading.Lock()
@@ -29,8 +39,9 @@ app = FastAPI(
         "Browse UI uses `/api/items*`. "
         "LAN rescan (manual) writes new server YAML when inventory is writable. "
         "Optional live-probe persist writes hardware/os/network into server YAML. "
-        "Mutating routes (live probe, network scan/add) require `CMDB_API_TOKEN` "
-        "when that env var is set (`X-CMDB-Token` or Bearer). "
+        "Mutating routes (live probe, confirm identity, settings, network scan/add) require "
+        "`CMDB_API_TOKEN` when that env var is set (`X-CMDB-Token` or Bearer). "
+        "Operational settings live on the PVC (`.cmdb/settings.yaml`); not MCP tools. "
         "LLM/tool agents should prefer `/api/agent/*` "
         "(discovery at `GET /api/agent`, OpenAPI at `/openapi.json`)."
     ),
@@ -49,10 +60,21 @@ class NetworkDeviceAdd(BaseModel):
     ports: list[int] = Field(default_factory=list, max_length=64)
     ssh_user: str | None = Field(None, max_length=32)
     notes: str | None = Field(None, max_length=2000)
+    mac: str | None = Field(None, max_length=32)
+    source: str | None = Field(None, max_length=32)
 
 
 class NetworkAddRequest(BaseModel):
     devices: list[NetworkDeviceAdd] = Field(..., min_length=1, max_length=64)
+
+
+class SettingsUpdate(BaseModel):
+    default_ssh_user: str | None = Field(None, max_length=32)
+    lan_cidrs: list[str] | str | None = None
+    default_env: str | None = Field(None, max_length=64)
+    discover_select_all: bool | None = None
+    confirm_sets_ssh: bool | None = None
+    confirm_probes_persist: bool | None = None
 
 
 @app.middleware("http")
@@ -79,6 +101,57 @@ def auth_status() -> dict[str, bool]:
 @app.get("/api/meta", tags=["browse", "agent"], summary="Inventory metadata")
 def meta() -> dict:
     return STORE.meta()
+
+
+@app.get(
+    "/api/settings",
+    tags=["browse"],
+    summary="Operational settings (effective + deployment facts)",
+    description="PVC settings merged over Helm/env. Not an agent/MCP tool.",
+)
+def get_settings() -> dict[str, Any]:
+    eff = effective_settings(STORE.root)
+    return {
+        "ok": True,
+        "writable": STORE.inventory_writable(),
+        "settings_path": ".cmdb/settings.yaml",
+        "effective": {
+            "default_ssh_user": eff["default_ssh_user"],
+            "lan_cidrs": eff["lan_cidrs"],
+            "default_env": eff["default_env"],
+            "discover_select_all": eff["discover_select_all"],
+            "confirm_sets_ssh": eff["confirm_sets_ssh"],
+            "confirm_probes_persist": eff["confirm_probes_persist"],
+            "updated": eff.get("updated"),
+        },
+        "stored": eff["stored"],
+        "sources": eff["sources"],
+        "deployment": deployment_facts(),
+        "envs": STORE.meta().get("envs") or [],
+    }
+
+
+@app.put(
+    "/api/settings",
+    tags=["browse"],
+    summary="Update operational settings on the PVC",
+    description="Writes `.cmdb/settings.yaml`. Manual UI only — never poll. Not MCP.",
+    dependencies=[Depends(require_api_token)],
+)
+def put_settings(body: SettingsUpdate) -> dict[str, Any]:
+    if not STORE.inventory_writable():
+        raise HTTPException(
+            status_code=409,
+            detail=f"Inventory is not writable at {STORE.root}",
+        )
+    patch = body.model_dump(exclude_unset=True)
+    try:
+        save_settings(STORE.root, patch)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to write settings: {exc}") from exc
+    return get_settings()
 
 
 @app.get("/api/items", tags=["browse"], summary="List/filter CIs (browse UI)")
@@ -149,12 +222,41 @@ def probe_item_live(
 
 
 @app.post(
+    "/api/items/{item_id}/confirm",
+    tags=["browse"],
+    summary="Confirm identity of an unconfirmed server",
+    description=(
+        "Promotes a server with status unknown to active and clears the default "
+        "LAN-rescan confirmation note. Manual UI action only — never poll. "
+        "Not part of the agent API / MCP tools."
+    ),
+    dependencies=[Depends(require_api_token)],
+)
+def confirm_item_identity(item_id: str) -> dict[str, Any]:
+    try:
+        result = STORE.confirm_server_identity(item_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=f"CI not found: {item_id}") from exc
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to write inventory: {exc}") from exc
+    return {"ok": True, **result}
+
+
+@app.post(
     "/api/network/scan",
     tags=["browse"],
     summary="One-shot LAN rescan for unknown hosts",
     description=(
-        "Sweeps inventory-derived subnets (env.network.lan_cidr or /24s from server "
-        "IPv4s). Manual UI action only — never poll. Not part of the agent/MCP API."
+        "Sweeps LAN prefixes from CMDB_LAN_CIDR / CMDB_NODE_IP / host interfaces, "
+        "unioned with env.network.lan_cidr and server address /24s. "
+        "Returns unknown hosts for Add plus a diff vs the last scan snapshot "
+        "(added / removed / modified). Persists baseline under "
+        "`.cmdb/last-network-scan.json` when writable. "
+        "Manual UI action only — never poll. Not part of the agent/MCP API."
     ),
     dependencies=[Depends(require_api_token)],
 )
@@ -170,8 +272,31 @@ def network_scan() -> dict[str, Any]:
         for row in result.get("discovered") or []:
             ip = row.get("ip")
             row["in_unidentified"] = ip in unidentified
+        for row in result.get("observed") or []:
+            ip = row.get("ip")
+            row["in_unidentified"] = ip in unidentified
+
+        previous = load_last_network_scan(Path(ctx["root"]))
+        result["diff"] = diff_observations(previous, list(result.get("observed") or []))
+
+        saved = None
+        if ctx["writable"]:
+            saved = save_last_network_scan(
+                Path(ctx["root"]),
+                scanned_at=str(result.get("scanned_at") or ""),
+                subnets=list(result.get("subnets") or []),
+                hosts=list(result.get("observed") or []),
+            )
+        result["snapshot_saved"] = bool(saved)
+        result["snapshot_path"] = saved
+        # Keep response lean — full observed set is persisted; UI uses discovered + diff.
+        result.pop("observed", None)
+
         result["writable"] = ctx["writable"]
         result["root"] = ctx["root"]
+        settings = ctx.get("settings") or {}
+        result["discover_select_all"] = bool(settings.get("discover_select_all", True))
+        result["default_env"] = settings.get("default_env") or ""
         return result
     finally:
         _SCAN_LOCK.release()

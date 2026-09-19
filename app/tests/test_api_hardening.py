@@ -145,6 +145,42 @@ class TestScanCaps:
         assert result["targets"] == 0
         assert any("Skipping IPv4 sweep" in n for n in result.get("notes") or [])
 
+    def test_derive_subnets_unions_node_ip_with_sample_lan(self, monkeypatch) -> None:
+        from cmdb_api.scan import derive_subnets
+
+        monkeypatch.setenv("CMDB_NODE_IP", "192.168.1.109")
+        monkeypatch.delenv("CMDB_LAN_CIDR", raising=False)
+        items = [
+            {
+                "kind": "environment",
+                "network": {"lan_cidr": "10.0.0.0/24"},
+            },
+            {
+                "kind": "server",
+                "addresses": {"ipv4": "10.0.0.20"},
+            },
+        ]
+        subnets = derive_subnets(items)
+        assert "192.168.1.0/24" in subnets
+        assert "10.0.0.0/24" in subnets
+
+    def test_derive_subnets_skips_cluster_overlay_node_ip(self, monkeypatch) -> None:
+        from cmdb_api.scan import derive_subnets, private_lan_slash24
+
+        monkeypatch.setenv("CMDB_NODE_IP", "10.42.1.5")
+        monkeypatch.delenv("CMDB_LAN_CIDR", raising=False)
+        assert private_lan_slash24("10.42.1.5") is None
+        assert derive_subnets([]) == []
+
+    def test_derive_subnets_honors_cmdb_lan_cidr(self, monkeypatch) -> None:
+        from cmdb_api.scan import derive_subnets
+
+        monkeypatch.delenv("CMDB_NODE_IP", raising=False)
+        monkeypatch.setenv("CMDB_LAN_CIDR", "192.168.1.0/24, 10.10.0.0/24")
+        subnets = derive_subnets([])
+        assert "192.168.1.0/24" in subnets
+        assert "10.10.0.0/24" in subnets
+
     def test_allows_typical_slash24(self) -> None:
         from cmdb_api.scan import IPV4_SWEEP_MAX_HOSTS
 
@@ -334,6 +370,118 @@ class TestApiRoutes:
         assert body["persisted"] is False
         after = (inventory_root / "servers" / "srv-test.yaml").read_text(encoding="utf-8")
         assert after == before
+
+    def test_confirm_identity_promotes_unknown_server(
+        self, client: TestClient, inventory_root: Path
+    ) -> None:
+        from cmdb_api.scan import LAN_RESCAN_NOTE
+
+        path = inventory_root / "servers" / "srv-unconfirmed.yaml"
+        path.write_text(
+            "\n".join(
+                [
+                    "id: srv-unconfirmed",
+                    "kind: server",
+                    "name: unconfirmed",
+                    "status: unknown",
+                    f"notes: {LAN_RESCAN_NOTE}",
+                    "addresses:",
+                    "  ipv4: 192.168.1.99",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        import cmdb_api.main as main_mod
+
+        main_mod.STORE.reload()
+        res = client.post("/api/items/srv-unconfirmed/confirm")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["ok"] is True
+        assert body["status"] == "active"
+        assert body.get("notes") in (None, "")
+        yaml_text = path.read_text(encoding="utf-8")
+        assert "status: active" in yaml_text
+        assert LAN_RESCAN_NOTE not in yaml_text
+        detail = client.get("/api/items/srv-unconfirmed").json()
+        assert detail["status"] == "active"
+
+    def test_confirm_identity_rejects_already_active(
+        self, client: TestClient
+    ) -> None:
+        res = client.post("/api/items/srv-test/confirm")
+        assert res.status_code == 400
+
+    def test_settings_api_get_put(self, client: TestClient, inventory_root: Path) -> None:
+        got = client.get("/api/settings")
+        assert got.status_code == 200
+        body = got.json()
+        assert body["ok"] is True
+        assert "effective" in body
+        assert "deployment" in body
+
+        put = client.put(
+            "/api/settings",
+            json={
+                "default_ssh_user": "lou",
+                "lan_cidrs": "192.168.1.0/24",
+                "discover_select_all": True,
+                "confirm_sets_ssh": True,
+                "confirm_probes_persist": False,
+                "default_env": "demo-lab",
+            },
+        )
+        assert put.status_code == 200, put.text
+        assert put.json()["stored"]["default_ssh_user"] == "lou"
+        assert put.json()["effective"]["default_ssh_user"] == "lou"
+        assert (inventory_root / ".cmdb" / "settings.yaml").is_file()
+
+    def test_settings_rejects_bad_cidr(self, client: TestClient) -> None:
+        res = client.put("/api/settings", json={"lan_cidrs": ["not-a-cidr"]})
+        assert res.status_code == 400
+
+    def test_confirm_sets_ssh_from_settings(
+        self, client: TestClient, inventory_root: Path
+    ) -> None:
+        from cmdb_api.scan import LAN_RESCAN_NOTE
+
+        client.put(
+            "/api/settings",
+            json={
+                "default_ssh_user": "lou",
+                "confirm_sets_ssh": True,
+                "confirm_probes_persist": False,
+            },
+        )
+        path = inventory_root / "servers" / "srv-need-ssh.yaml"
+        path.write_text(
+            "\n".join(
+                [
+                    "id: srv-need-ssh",
+                    "kind: server",
+                    "name: need-ssh",
+                    "status: unknown",
+                    f"notes: {LAN_RESCAN_NOTE}",
+                    "addresses:",
+                    "  ipv4: 192.168.1.77",
+                    "ports_observed:",
+                    "  - 22",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        import cmdb_api.main as main_mod
+
+        main_mod.STORE.reload()
+        res = client.post("/api/items/srv-need-ssh/confirm")
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["status"] == "active"
+        assert body["ssh_set"] is True
+        assert body["ssh"] == "lou@192.168.1.77"
+        assert "ssh: lou@192.168.1.77" in path.read_text(encoding="utf-8")
 
     def test_bearer_auth_accepted(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch

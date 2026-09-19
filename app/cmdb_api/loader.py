@@ -12,8 +12,9 @@ from typing import Any
 import yaml
 
 from cmdb_api.addresses import AddressExtractor
-from cmdb_api.probe import static_hardware_from_live
+from cmdb_api.probe import probe_host, static_hardware_from_live
 from cmdb_api.scan import (
+    LAN_RESCAN_NOTE,
     build_server_document,
     collect_inventory_hostnames,
     collect_known_ips,
@@ -22,10 +23,13 @@ from cmdb_api.scan import (
     ip_from_cidr_or_addr,
     ipv4_from_cidr_or_addr,
     ipv6_from_cidr_or_addr,
+    merge_scan_add_entries,
+    normalize_mac,
     suggest_server_id,
     validate_server_id,
     validate_ssh_user,
 )
+from cmdb_api.settings import effective_settings
 
 KIND_DIRS = {
     "server": "servers",
@@ -355,7 +359,8 @@ class CmdbStore:
         """Subnets + known IPs for a one-shot LAN rescan."""
         with self._lock:
             items = list(self._items.values())
-        subnets = derive_subnets(items)
+        eff = effective_settings(self.root)
+        subnets = derive_subnets(items, extra_lan_cidrs=list(eff.get("lan_cidrs") or []))
         known = collect_known_ips(items)
         unidentified = collect_unidentified_ips(items)
         hostnames = collect_inventory_hostnames(items)
@@ -366,6 +371,7 @@ class CmdbStore:
             "hostnames": sorted(hostnames),
             "writable": self.inventory_writable(),
             "root": str(self.root),
+            "settings": eff,
         }
 
     def inventory_writable(self) -> bool:
@@ -462,6 +468,109 @@ class CmdbStore:
             "fields": fields,
         }
 
+    def confirm_server_identity(self, item_id: str) -> dict[str, Any]:
+        """Promote an unconfirmed server (status unknown) to active.
+
+        Clears the default LAN-rescan boilerplate note when present. Optional
+        settings may set ``ssh:`` from the default user and run a one-shot
+        probe+persist. Manual UI Confirm only — not an agent/MCP tool.
+        """
+        if not self.inventory_writable():
+            raise PermissionError(
+                f"Inventory is not writable at {self.root} "
+                "(need a writable PVC/bind-mount for /data/cmdb)"
+            )
+
+        eff = effective_settings(self.root)
+        with self._lock:
+            item = self._items.get(item_id)
+            if not item:
+                raise KeyError(item_id)
+            if item.get("kind") != "server":
+                raise ValueError("Confirm identity is only supported for servers")
+            status = str(item.get("status") or "unknown")
+            if status != "unknown":
+                raise ValueError(f"Server status is already {status!r} (expected unknown)")
+            rel = str(item.get("path") or "")
+            if not rel or rel.startswith("/") or ".." in Path(rel).parts:
+                raise ValueError(f"Server has no safe inventory path: {item_id}")
+
+        path = (self.root / rel).resolve()
+        if not path.is_file() or not str(path).startswith(str(self.root.resolve())):
+            raise FileNotFoundError(f"Inventory file missing: {rel}")
+
+        ssh_set = False
+        with self._lock:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            if not isinstance(raw, dict):
+                raise ValueError(f"Inventory root is not a mapping: {rel}")
+            doc = dict(raw)
+            doc["status"] = "active"
+            doc["updated"] = date.today().isoformat()
+            notes = doc.get("notes")
+            if isinstance(notes, str):
+                cleaned = notes.replace(LAN_RESCAN_NOTE, "").strip()
+                cleaned = "\n".join(line for line in cleaned.splitlines() if line.strip())
+                if cleaned:
+                    doc["notes"] = cleaned
+                else:
+                    doc.pop("notes", None)
+
+            if eff.get("confirm_sets_ssh") and not (isinstance(doc.get("ssh"), str) and doc["ssh"].strip()):
+                user = str(eff.get("default_ssh_user") or "").strip()
+                ports = doc.get("ports_observed") or []
+                port_list = [
+                    int(p)
+                    for p in ports
+                    if isinstance(p, (int, float, str)) and str(p).isdigit() and int(p) == 22
+                ]
+                addresses = doc.get("addresses") if isinstance(doc.get("addresses"), dict) else {}
+                ipv4 = ipv4_from_cidr_or_addr(addresses.get("ipv4")) if addresses else None
+                ipv6 = ipv6_from_cidr_or_addr(addresses.get("ipv6")) if addresses else None
+                if user and port_list and (ipv4 or ipv6):
+                    err = validate_ssh_user(user)
+                    if err:
+                        raise ValueError(err)
+                    if ipv4:
+                        doc["ssh"] = f"{user}@{ipv4}"
+                    else:
+                        doc["ssh"] = f"{user}@[{ipv6}]"
+                    ssh_set = True
+
+            with path.open("w", encoding="utf-8") as handle:
+                yaml.safe_dump(doc, handle, sort_keys=False, default_flow_style=False)
+            self.reload()
+
+        probe_result: dict[str, Any] | None = None
+        persisted = False
+        if eff.get("confirm_probes_persist"):
+            refreshed_pre = self.get_item(item_id)
+            ssh = refreshed_pre.get("ssh") if refreshed_pre else None
+            if isinstance(ssh, str) and ssh.strip():
+                probe_result = probe_host(ssh)
+                if probe_result.get("ok") and isinstance(probe_result.get("live"), dict):
+                    try:
+                        self.apply_observed_specs(item_id, probe_result["live"])
+                        persisted = True
+                    except (ValueError, FileNotFoundError, PermissionError, KeyError, OSError):
+                        persisted = False
+
+        refreshed = self.get_item(item_id)
+        if not refreshed:
+            raise KeyError(item_id)
+        return {
+            "id": item_id,
+            "path": rel,
+            "status": refreshed.get("status"),
+            "updated": refreshed.get("updated"),
+            "notes": refreshed.get("notes"),
+            "ssh_set": ssh_set,
+            "ssh": refreshed.get("ssh"),
+            "probe": probe_result,
+            "persisted": persisted,
+            "item": refreshed,
+        }
+
     def create_servers_from_scan(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
         """Write new server YAML files from LAN-scan selections, then reload."""
         if not entries:
@@ -480,7 +589,7 @@ class CmdbStore:
             existing_ids = set(self._items.keys())
             known_ips = collect_known_ips(self._items.values())
 
-        for raw in entries:
+        for raw in merge_scan_add_entries(list(entries)):
             if not isinstance(raw, dict):
                 errors.append({"error": "Invalid entry (expected object)"})
                 continue
@@ -516,6 +625,10 @@ class CmdbStore:
             name = str(raw.get("name") or "").strip() or (hostname_s.split(".")[0] if hostname_s else primary)
             env = raw.get("env")
             env_s = str(env).strip() if isinstance(env, str) and env.strip() else None
+            eff = effective_settings(self.root)
+            if not env_s:
+                default_env = str(eff.get("default_env") or "").strip()
+                env_s = default_env or None
             status = str(raw.get("status") or "unknown").strip() or "unknown"
             if status not in {"active", "deprecated", "planned", "unknown"}:
                 errors.append({"ip": primary, "id": item_id, "error": f"Invalid status: {status}"})
@@ -530,7 +643,7 @@ class CmdbStore:
                 and 1 <= int(p) <= 65535
             ]
             ssh_user = raw.get("ssh_user")
-            default_ssh = os.environ.get("CMDB_DEFAULT_SSH_USER", "").strip()
+            default_ssh = str(eff.get("default_ssh_user") or "").strip()
             ssh_user_s = (
                 str(ssh_user).strip()
                 if isinstance(ssh_user, str) and ssh_user.strip()
@@ -549,6 +662,14 @@ class CmdbStore:
                 errors.append({"ip": primary, "id": item_id, "error": "name too long (max 128)"})
                 continue
 
+            mac_s = normalize_mac(raw.get("mac"))
+            source_raw = raw.get("source")
+            source_s = (
+                str(source_raw).strip()
+                if isinstance(source_raw, str) and source_raw.strip()
+                else None
+            )
+
             doc = build_server_document(
                 item_id=item_id,
                 name=name,
@@ -560,6 +681,8 @@ class CmdbStore:
                 ports=ports or None,
                 ssh_user=ssh_user_s,
                 notes=notes_s,
+                mac=mac_s,
+                source=source_s,
             )
             path = servers_dir / f"{item_id}.yaml"
             try:
