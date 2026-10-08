@@ -8,7 +8,7 @@ COPY app/frontend/ ./
 RUN if [ -f dist/index.html ]; then \
       echo "Using prebuilt frontend dist"; \
     else \
-      npm ci && npm run build; \
+      corepack enable && corepack prepare pnpm@10.32.1 --activate && pnpm install --frozen-lockfile && npm run build; \
     fi
 
 FROM python:3.10-slim-bookworm AS runtime
